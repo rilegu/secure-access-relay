@@ -1,0 +1,89 @@
+# ---------------------------------------------------------------------------
+# Secrets and key material — NEVER commit. Keep these rules at the top.
+# ---------------------------------------------------------------------------
+*.pem
+*.key
+*.crt
+*.cer
+*.pfx
+*.p12
+*.jks
+*.der
+*.csr
+certs/
+secrets/
+.env
+.env.*
+!.env.example
+*.token
+enrollment-token*
+dev-ca/
+
+# ---------------------------------------------------------------------------
+# Go
+# ---------------------------------------------------------------------------
+bin/
+dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.*
+vendor/
+go.work
+go.work.sum
+
+# ---------------------------------------------------------------------------
+# Native (C) build artifacts
+# ---------------------------------------------------------------------------
+native/**/build/
+native/**/out/
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.idb
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+
+# ---------------------------------------------------------------------------
+# Installer output
+# ---------------------------------------------------------------------------
+installer/**/obj/
+installer/**/bin/
+*.msi
+*.wixpdb
+*.wixobj
+
+# ---------------------------------------------------------------------------
+# Local runtime state / logs / databases
+# ---------------------------------------------------------------------------
+*.log
+*.sqlite
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+state/
+run/
+support-bundle*/
+
+# ---------------------------------------------------------------------------
+# Editors / OS
+# ---------------------------------------------------------------------------
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.shared.json
+.vs/
+.idea/
+*.swp
+*~
+Thumbs.db
+desktop.ini
+.DS_Store

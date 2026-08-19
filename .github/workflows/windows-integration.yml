@@ -1,0 +1,23 @@
+# Windows integration tests install services, alter firewall state, and inject
+# network failures. Never run on a developer host - manual dispatch or schedule only.
+name: windows-integration
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 5 * * 1"
+
+env:
+  CGO_ENABLED: "0"
+
+jobs:
+  windows-integration:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+      - name: windows integration tests
+        run: go test -tags=windows_integration -count=1 ./...
