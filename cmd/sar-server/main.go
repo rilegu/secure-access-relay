@@ -2,22 +2,71 @@
 //
 // The control plane owns identity, enrollment, the resource registry, policy
 // evaluation, grant issuance, and audit. The relay pairs already-authorized
-// streams between operators and agents.
+// streams between operators and agents. They are separate package trees with no
+// cross-imports: the relay makes no authorization decisions and the control
+// plane carries no payload traffic. See
+// docs/decisions/0007-one-binary-two-package-trees.md.
 //
-// These are separate package trees with no cross-imports: the relay makes no
-// authorization decisions and the control plane carries no payload traffic.
-// See docs/decisions/0007-one-binary-two-package-trees.md.
+// Only the relay half exists so far. There is no transport encryption, no peer
+// authentication, and no authorization: anything that reaches the operator port
+// gets a stream. Run it on a development machine, never on a reachable network.
 package main
 
 import (
+	"context"
+	"flag"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
+
+	"github.com/rilegu/secure-access-relay/internal/logging"
+	"github.com/rilegu/secure-access-relay/internal/relay"
 )
 
 // version is set at build time via -ldflags.
 var version = "dev"
 
 func main() {
-	fmt.Fprintf(os.Stderr, "sar-server %s: not implemented yet\n", version)
-	os.Exit(1)
+	if err := run(); err != nil {
+		fmt.Fprintf(os.Stderr, "sar-server: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	var (
+		agentAddr    = flag.String("agent-addr", "127.0.0.1:17070", "address to accept endpoint agent connections on")
+		operatorAddr = flag.String("operator-addr", "127.0.0.1:17071", "address to accept operator connections on")
+		logLevel     = flag.String("log-level", "info", "log level: debug, info, warn, error")
+		showVersion  = flag.Bool("version", false, "print version and exit")
+	)
+	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(version)
+		return nil
+	}
+
+	log := logging.New(*logLevel)
+	log.Warn("development build: no encryption, no authentication, no authorization")
+
+	// Signal handling is the whole shutdown story: cancelling the context closes
+	// the listeners, which unblocks the accept loops. Without it a Ctrl-C would
+	// kill the process with connections mid-flight and no closing audit lines.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	srv := relay.New(relay.Config{
+		AgentAddr:    *agentAddr,
+		OperatorAddr: *operatorAddr,
+		Logger:       log,
+	})
+
+	err := srv.Run(ctx)
+	if err != nil && ctx.Err() == nil {
+		return err
+	}
+	log.Info("shutdown complete")
+	return nil
 }

@@ -5,16 +5,21 @@ PKGS     := ./...
 
 export CGO_ENABLED := 0
 
-.PHONY: all build test lint vet fmt tidy clean integration win-integration
+.PHONY: all build test test-race lint vet fmt tidy clean integration win-integration
 
-all: lint test build
+all: lint test test-race build
 
 build:
 	$(GO) build $(GOFLAGS) -o $(BIN)/ ./cmd/...
 
 ## fast, deterministic unit tests - must pass on every commit
 test:
-	$(GO) test -race -count=1 $(PKGS)
+	$(GO) test -count=1 $(PKGS)
+
+## same tests under the race detector. Needs cgo and a C toolchain, which is why
+## it is separate: shipped binaries stay CGO_ENABLED=0, the test harness does not.
+test-race:
+	CGO_ENABLED=1 $(GO) test -race -count=1 $(PKGS)
 
 ## component tests (control plane, relay protocol, storage)
 integration:

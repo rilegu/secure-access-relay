@@ -80,6 +80,16 @@ Stated plainly. A security tool that hides its limitations is worse than one tha
 - **Single organization.** `organization_id` exists in the schema from day one, but
   multi-tenant isolation is not tested or claimed.
 - **Local Administrator on the endpoint defeats this system.** By design; see out of scope.
+- **This system grants access; it does not restrict existing access.** Installing an
+  agent adds an authorized path to a service. It does not remove any path that already
+  existed. A service already listening on a routable interface stays reachable from that
+  network, unaudited, exactly as before — the agent does not intercept, filter, or
+  firewall it.
+
+  The strong case is therefore a service bound to loopback, where the agent is the *only*
+  path and every use of it is audited. Where a service also listens on the LAN, the audit
+  trail covers the remote sessions and nothing else. Anyone evaluating this system for a
+  particular deployment needs to know which of the two they have.
 
 ## Failure policy
 
