@@ -4,8 +4,21 @@ Two planes, deliberately different technologies.
 
 | Plane | Transport | Encoding | Rationale |
 | ----- | --------- | -------- | --------- |
-| Control | HTTPS (mTLS for agents) | JSON | Curl-able, self-describing, trivial to document and demo |
+| Control | HTTPS | JSON | Curl-able, self-describing, trivial to document and demo |
 | Data | TLS 1.3 over TCP | custom binary frames | Multiplexing, backpressure, and limits are the point |
+
+### Client authentication differs between the planes
+
+The data plane requires mutual TLS: a peer without a certificate from this deployment's
+authority is refused during the handshake.
+
+The control plane's only endpoint today is enrollment, and it is **server-authenticated
+only**. It cannot require a client certificate, because a peer enrolls precisely because
+it does not have one. The token authenticates the client; the authority fingerprint
+carried in the enrollment code authenticates the server.
+
+Control endpoints added later — listing devices, requesting grants, querying audit — will
+require mutual TLS, since their callers are already enrolled by then.
 
 ## Data plane framing
 

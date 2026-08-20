@@ -89,7 +89,8 @@ internal/
   storage/       enrolled identities and enrollment tokens
   config/ logging/
   e2e/           every component wired together in one process
-  winsvc/ winpipe/ wincrypt/ wfp/ diagbridge/    all //go:build windows
+  winsvc/        Windows service: SCM dispatcher, install, start, stop, status
+  winpipe/ wfp/ diagbridge/                    all //go:build windows
 native/sardiag/  include/ src/ tests/   C diagnostics library
 deploy/          docker compose for control plane, relay, and database
 installer/       PowerShell installer, then WiX/MSI

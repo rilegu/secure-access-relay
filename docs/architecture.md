@@ -51,7 +51,7 @@ the security layers:
 
 | Component | Today |
 | --------- | ----- |
-| `sar-agent` | enrolls, holds an outbound mTLS session, serves concurrent streams to one configured loopback target, reconnects on failure. No service packaging, no grant verification. |
+| `sar-agent` | runs as a Windows service with delayed auto-start and restart-on-failure. Enrolls, holds an outbound mTLS session, serves concurrent streams to one configured loopback target, reconnects on failure. No grant verification. |
 | `sar-server` | control plane (authority, enrollment, revocation) **and** relay (one listener for both roles, registry keyed by device, stream joining). No policy engine. |
 | `sarctl` | enrolls, opens one relay session carrying many streams. No login flow, no grant request, no audit query. |
 | Transport | **TLS 1.3, mutual, on every data-plane connection.** |
@@ -69,7 +69,11 @@ Enforced today:
 - **Resource targets are loopback-only.** The agent refuses to start otherwise.
 - **Flow control is enforced, not advisory.** A peer exceeding its granted window has its
   session terminated rather than being allowed to grow a buffer.
-- **Device keys are sealed with DPAPI on Windows.**
+- **Device keys are sealed with DPAPI on Windows**, and the state directory's ACL is set
+  explicitly at install time so Users have no access. Inheritance is broken deliberately:
+  the default inherited ACL grants Users read access, which would expose device state.
+- **Operational events reach the Windows Event Log** as well as the structured JSON log,
+  so an administrator looking in the usual place finds something.
 
 The largest remaining gap is authorization: nothing decides *whether* a given operator
 may reach a given resource. Until that exists, the trust boundary table below describes

@@ -11,7 +11,7 @@ converts a failure into broader access.**
 | Unit | none | any OS, every commit | frame codec, grant verification, policy evaluator, limits, backoff, redaction |
 | Wiring | none | any OS, every commit | all components in one process: forwarding, device routing across several endpoints, concurrency, refusal paths, transfer integrity, mid-stream teardown |
 | Component | `integration` | Linux + Windows CI | control plane, storage, fake agent — **none written yet** |
-| Windows integration | `windows_integration` | disposable Windows VM only | SCM lifecycle, named pipes, DPAPI, cert store, WFP, installer |
+| Windows integration | `windows_integration` | disposable Windows VM only, **needs Administrator** | SCM lifecycle — **implemented**; named pipes, WFP, installer — not yet |
 | System E2E | scripted | isolated VM + control/relay | enrollment through teardown, with audit assertions |
 | Chaos / demo | manual | dedicated lab VM | network loss, crash, reboot, upgrade, uninstall |
 
@@ -140,10 +140,18 @@ An operator must be able to tell "you may not" from "it is down" without reading
 **Service lifecycle**
 
 ```powershell
-sc.exe start   SecureAccessRelay
-sc.exe query   SecureAccessRelay
-sc.exe stop    SecureAccessRelay
+sar-agent service install -relay-addr ... -target 127.0.0.1:8080
+sar-agent service start
+sar-agent service status
+sar-agent service stop
+sar-agent service uninstall
 ```
+
+`internal/winsvc` has integration tests behind the `windows_integration` tag covering
+install, duplicate install, status, stop, uninstall, and that every operation on a
+missing service reports it as missing rather than as a generic failure. They register a
+real service under a distinct name so a failed run cannot leave behind something that
+looks like a real installation.
 
 - Graceful stop within the SCM timeout; in-flight streams closed with `shutdown`
 - Delayed-auto-start survives reboot and reconnects
