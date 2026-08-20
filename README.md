@@ -38,22 +38,49 @@ nobody will change, and that "access" is normally all-or-nothing.
  ┌────────────┐              ┌──────────────┐              ┌──────────────────┐
  │ browser /  │              │  sar-server  │              │    sar-agent     │
  │ ssh / psql │              │              │              │                  │
- │     │      │   outbound   │  public IP,  │   outbound   │  dials out only, │
- │     ▼      │─────────────▶│  the ONLY    │◀─────────────│  never listens   │
- │ 127.0.0.1: │              │  listener    │              │        │         │
+ │     │      │  outbound    │  public IP,  │   outbound   │  dials out only, │
+ │     ▼      │  mutual TLS  │  the ONLY    │  mutual TLS  │  never listens   │
+ │ 127.0.0.1: │═════════════▶│  listener    │◀═════════════│        │         │
  │   18080    │              │  anywhere    │              │        ▼         │
- │   sarctl   │              └──────────────┘              │  127.0.0.1:8080  │
- └────────────┘                                            │  the service     │
-                                                           └──────────────────┘
-   no inbound rule                                            no inbound rule
+ │   sarctl   │              │              │              │  127.0.0.1:8080  │
+ └────────────┘              │ + control    │              │  the service     │
+                             │   plane      │              └──────────────────┘
+   no inbound rule           └──────────────┘                 no inbound rule
 ```
 
 Both ends **dial outward**. The only machine that accepts an incoming connection is the
 relay, which you place deliberately and harden. Neither network needs a firewall change.
 
+Every connection is mutual TLS, and a peer's identity comes from its certificate rather
+than from anything it says about itself. An unenrolled peer is refused during the TLS
+handshake, before it can send a single protocol frame.
+
 The operator names a **resource**, never an address. The agent resolves that name against
 its own local allowlist and refuses anything that is not loopback. That is the difference
 between a resource proxy and a tunnel.
+
+### Enrollment, once per peer
+
+```
+  admin ──▶ sar-server token -device panel-01
+                  │
+                  ├── single-use code, valid one hour, carrying the
+                  │   authority fingerprint so the peer can verify
+                  │   the server before sending anything
+                  ▼
+            hand it to the endpoint
+                  │
+                  ▼
+  endpoint ──▶ sar-agent enroll -code sar1...
+                  │  generates its own key, which never leaves the machine
+                  │  sends only a certificate request
+                  ▼
+            certificate + authority, key sealed with DPAPI on Windows
+```
+
+The identity comes from the **token**, never from the certificate request — a request is
+written by whoever wants a certificate, so nothing in it is a fact. Re-enrolling replaces
+the certificate on file, so the previous one stops working.
 
 ## Use cases
 
@@ -82,9 +109,9 @@ becomes reachable only through an authorized, time-bounded, recorded session.
 
 | Binary | Runs on | Role |
 | ------ | ------- | ---- |
-| `sar-agent` | the protected machine | Outbound session, local resource allowlist, dials only loopback. Never listens. |
-| `sar-server` | a reachable VM you control | Relay: joins authorized streams. Later also the control plane. |
-| `sarctl` | the operator's laptop | Opens a local loopback listener and carries it through the relay. |
+| `sar-agent` | the protected machine | Enrolls once, then holds an outbound mTLS session. Local resource allowlist, dials only loopback. Never listens. |
+| `sar-server` | a reachable VM you control | Control plane (certificate authority, enrollment, revocation) **and** relay (joins authorized streams). |
+| `sarctl` | the operator's laptop | Enrolls once, then opens a local loopback listener and carries it through the relay. |
 | `sardiag` | the protected machine | Optional C diagnostics library, dynamically loaded. Not yet written. |
 
 The relay can be entirely self-hosted — a DMZ box, a VPS, your own cloud account. No
@@ -96,6 +123,17 @@ The parts that make this different from a tunnel with a login:
 
 **Outbound-only, both ends.** The agent never calls `listen`. There is no port to scan,
 no rule to request, and no exposure added to the protected machine.
+
+**The certificate is the identity.** A peer's identity — including whether it is a device
+or an operator — comes from a URI in its certificate, never from what it says about
+itself. A claim that disagrees with the certificate ends the connection. Enrollment is
+bootstrapped by pinning the authority's fingerprint inside the enrollment code, so a peer
+with no trust anchor can still verify the control plane before sending its token. See
+[ADR-0010](docs/decisions/0010-certificate-is-the-identity.md).
+
+**Re-enrolling invalidates the old certificate.** The control plane records which
+certificate is current for an identity, so rotating after a suspected compromise is a
+remedy rather than a ritual.
 
 **Loopback-only targets, enforced at startup.** A target must be a literal loopback
 address with an explicit port. Hostnames are rejected outright, so **no DNS lookup is ever
@@ -126,14 +164,21 @@ request/response exchange can complete. A broken connection aborts both, because
 half-closing a broken peer leaves it blocked forever on credit that will never arrive —
 [ADR-0009](docs/decisions/0009-half-close-and-abort.md).
 
-**Zero external dependencies.** The entire system is the Go standard library. Binaries are
-static, ~4 MB, `CGO_ENABLED=0`, and cross-compile to Linux, Windows, and ARM from any host.
+**Dependencies have to earn their place.** Every one must survive the question *"why not
+the standard library?"*, and so far none have: the entire system today is stdlib, and
+that includes the Windows DPAPI binding and the multiplexer. Binaries are static, ~4 MB,
+`CGO_ENABLED=0`, and cross-compile to Linux, Windows, and ARM from any host.
+
+That count will not stay at zero. A database arrives with the policy engine and audit
+trail, because correctness there is hard to write and easy to get subtly wrong — see
+[ADR-0011](docs/decisions/0011-sqlite-not-key-value.md). The rule is the property worth
+keeping, not the number.
 
 ## Status
 
-**The data path works; the security layers do not exist yet.** Traffic is forwarded end to
-end, but there is no encryption and no authorization. Device and user identities are
-claims that nothing verifies, so any peer that can reach the relay may name any endpoint.
+**Transport and identity work; authorization does not.** Every connection is mutual TLS
+and every peer is an enrolled identity proved by certificate. What is missing is policy:
+any enrolled operator may reach any enrolled device, because grants do not exist yet.
 
 | Capability | State |
 | ---------- | ----- |
@@ -146,9 +191,13 @@ claims that nothing verifies, so any peer that can reach the relay may name any 
 | Keepalives and idle-timeout detection | working |
 | Loopback-only target enforcement | working |
 | Reconnect after a dropped relay connection | working |
-| mTLS and device enrollment | not implemented |
-| End-to-end encryption between operator and agent | not implemented |
+| Mutual TLS on every connection | working |
+| Enrollment with single-use tokens | working |
+| Certificate-bound identity and roles | working |
+| Revocation and certificate supersession | working |
+| Device key sealed with DPAPI (Windows) | working |
 | Named resources and signed time-bound grants | not implemented |
+| End-to-end encryption between operator and agent | not implemented |
 | Operator login and audit trail | not implemented |
 | Windows Service packaging and installer | not implemented |
 | WFP leak guard | not implemented |
@@ -176,6 +225,14 @@ Beyond the unimplemented work above, these hold by design:
 - **Scoping is per port, not per operation.** The system controls who reaches which
   resource for how long. What is possible once connected is defined by the service behind
   that port.
+- **Revocation takes effect on the next connection, not immediately.** A session already
+  running continues until it ends. Restarting the relay is currently the way to drop one.
+- **Certificates expire after thirty days and are not renewed automatically.**
+  Re-enrolling is a manual step.
+- **Whoever hands over an enrollment code is trusted.** The code is single-use,
+  short-lived, and carries the authority fingerprint so the peer can verify the server it
+  enrolls with — but the channel that delivers it is outside the system. That is
+  unavoidable at the bottom of a trust chain.
 
 Full analysis, including the attacker model and eighteen threats mapped to controls, is in
 [docs/threat-model.md](docs/threat-model.md).
@@ -203,30 +260,46 @@ DNS, and proxy state behind a stable `extern "C"` ABI, loaded dynamically so the
 stays pure Go. C rather than C++ because C++ has no stable ABI and would need an
 `extern "C"` wrapper anyway — [ADR-0005](docs/decisions/0005-native-c-dynamically-loaded.md).
 
-Transport security will be **TLS 1.3 with mutual TLS**; authorization will be
-**Ed25519-signed grants** with a fixed claim set rather than JWT, because JWT's `alg`
-field is a decision a verifier can get wrong —
+Transport security is **TLS 1.3 with mutual TLS**, Ed25519 throughout — the authority,
+the certificates, and later the grants use one signature primitive rather than several.
+TLS 1.3 only: older versions bring renegotiation and cipher negotiation that exist for
+compatibility with software this project does not need to talk to.
+
+Authorization will be **Ed25519-signed grants** with a fixed claim set rather than JWT,
+because JWT's `alg` field is a decision a verifier can get wrong —
 [ADR-0003](docs/decisions/0003-ed25519-grants-not-jwt.md).
+
+**DPAPI is reached through the standard library**, not a third-party Windows binding.
+That keeps the dependency count at zero and rehearses the dynamic-loading technique the
+native diagnostics library will use.
 
 ## Trying it
 
-Four processes on one machine. Nothing listens on a routable interface.
+Everything on one machine. Nothing listens on a routable interface except the relay.
 
 ```sh
 make build
 
+# Mint single-use enrollment codes. The first call creates the authority.
+./bin/sar-server token -device panel-lab-01     # prints a code for the endpoint
+./bin/sar-server token -operator maria          # prints a code for the operator
+
+# Start the control plane and relay.
+./bin/sar-server run
+
+# Enroll, once per peer. Each generates its own key locally; only a certificate
+# request is ever transmitted.
+./bin/sar-agent enroll -code sar1...
+./bin/sarctl    enroll -code sar1...
+
 # A local service to expose. Binds strictly to loopback.
 go run ./testdata/fixtures/httpfixture.go -addr 127.0.0.1:8080
 
-# The relay. One listener; peers state their role in the handshake.
-./bin/sar-server -addr 127.0.0.1:17070
-
 # The endpoint agent. Dials out; never listens.
-./bin/sar-agent -relay-addr 127.0.0.1:17070 -device-id panel-lab-01 -target 127.0.0.1:8080
+./bin/sar-agent run -target 127.0.0.1:8080
 
 # The operator forward. Names the endpoint it wants; never an address.
-./bin/sarctl -relay-addr 127.0.0.1:17070 -device panel-lab-01 \
-             -resource diagnostics -listen 127.0.0.1:18080
+./bin/sarctl connect -device panel-lab-01 -resource diagnostics -listen 127.0.0.1:18080
 ```
 
 Then:
@@ -235,16 +308,24 @@ Then:
 curl http://127.0.0.1:18080/health
 ```
 
-The request travels `curl → sarctl → relay → agent → 127.0.0.1:8080` and back. The
-fixture is never reachable from outside the machine, and the protected machine opens no
-inbound port.
+The request travels `curl -> sarctl -> relay -> agent -> 127.0.0.1:8080` and back, over
+mutual TLS between each pair. The fixture is never reachable from outside the machine,
+and the protected machine opens no inbound port.
 
 To see the enforcement, point things where they must not go:
 
 ```sh
-./bin/sar-agent -device-id x -target 192.168.1.10:8080   # refuses to start: must be loopback
-./bin/sar-agent -device-id x -target localhost:8080      # refuses to start: names are not resolved
-./bin/sarctl -device x -listen 0.0.0.0:18080             # refuses to start: must be loopback
+./bin/sar-agent run -target 192.168.1.10:8080         # refuses to start: must be loopback
+./bin/sar-agent run -target localhost:8080            # refuses to start: names are not resolved
+./bin/sarctl connect -device x -listen 0.0.0.0:18080  # refuses to start: must be loopback
+./bin/sar-agent enroll -code <an already used code>   # refused: tokens are single use
+```
+
+Revoke an identity and it is refused on its next connection:
+
+```sh
+./bin/sar-server revoke -device panel-lab-01
+./bin/sar-server list
 ```
 
 ## Documentation

@@ -3,6 +3,8 @@ package operator
 import (
 	"errors"
 	"testing"
+
+	"github.com/rilegu/secure-access-relay/internal/identity"
 )
 
 // TestValidateListenAddr checks that a forward can only be published to the
@@ -53,7 +55,12 @@ func TestValidateListenAddr(t *testing.T) {
 // TestNewRejectsNonLoopbackListen checks the failure happens at construction
 // rather than at first connection.
 func TestNewRejectsNonLoopbackListen(t *testing.T) {
-	_, err := New(Config{RelayAddr: "127.0.0.1:1", DeviceID: "dev_test", ListenAddr: "0.0.0.0:18080"})
+	_, err := New(Config{
+		RelayAddr:  "127.0.0.1:1",
+		Identity:   &identity.Identity{},
+		DeviceID:   "dev_test",
+		ListenAddr: "0.0.0.0:18080",
+	})
 	if !errors.Is(err, ErrListenNotLoopback) {
 		t.Fatalf("New with a wildcard listen address returned %v, want ErrListenNotLoopback", err)
 	}
@@ -61,10 +68,18 @@ func TestNewRejectsNonLoopbackListen(t *testing.T) {
 
 // TestNewRequiresDeviceID checks that a forward must name the endpoint it wants.
 //
-// Without it the relay has nothing to route to. The identity proves nothing yet,
-// but its absence is a configuration error rather than a default.
+// The device is what the operator is asking for; without it the relay has nothing
+// to route to. Who is asking comes from the certificate, not from a flag.
 func TestNewRequiresDeviceID(t *testing.T) {
-	if _, err := New(Config{RelayAddr: "127.0.0.1:1", ListenAddr: "127.0.0.1:0"}); err == nil {
+	_, err := New(Config{RelayAddr: "127.0.0.1:1", Identity: &identity.Identity{}, ListenAddr: "127.0.0.1:0"})
+	if err == nil {
 		t.Fatal("New succeeded without a device id")
+	}
+}
+
+// TestNewRequiresIdentity checks that a forward cannot start without credentials.
+func TestNewRequiresIdentity(t *testing.T) {
+	if _, err := New(Config{RelayAddr: "127.0.0.1:1", DeviceID: "dev", ListenAddr: "127.0.0.1:0"}); err == nil {
+		t.Fatal("New succeeded without an identity")
 	}
 }

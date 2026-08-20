@@ -17,3 +17,5 @@ superseded by a later ADR that references them.
 | [0007](0007-one-binary-two-package-trees.md) | Control plane and relay ship as one binary, two package trees | accepted |
 | [0008](0008-no-existing-overlay-platform.md) | Build on TLS directly rather than adopt a zero-trust overlay | accepted |
 | [0009](0009-half-close-and-abort.md) | Streams half-close; broken connections abort | accepted |
+| [0010](0010-certificate-is-the-identity.md) | The certificate is the identity, not the claim | accepted |
+| [0011](0011-sqlite-not-key-value.md) | SQLite for control-plane state, not a key-value store | accepted |

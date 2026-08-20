@@ -92,15 +92,23 @@ the agent's check does not trust anything the relay says.
 
 ## Revocation
 
-| Trigger | Effect |
-| ------- | ------ |
-| Grant revoked | Relay drops matching live streams; agent drops on next control-plane sync or heartbeat |
-| Device revoked | Certificate rejected at next handshake; live session terminated |
-| User disabled | All that user's grants revoked |
-| Policy deleted | Existing grants remain valid until expiry, bounded by the 30-minute max TTL |
+| Trigger | Effect | Status |
+| ------- | ------ | ------ |
+| Grant revoked | Relay drops matching live streams; agent drops on next control-plane sync | not implemented |
+| Device or operator revoked | Refused at the next connection | **implemented** |
+| Device or operator revoked, session already running | Session terminated | **not implemented** |
+| Re-enrollment supersedes a certificate | Previous certificate refused | **implemented** |
+| User disabled | All that user's grants revoked | not implemented |
+| Policy deleted | Existing grants remain valid until expiry, bounded by the 30-minute max TTL | not implemented |
 
 Short TTLs are the primary revocation mechanism. Explicit revocation is the fast path,
 not the only path.
+
+**Revocation does not currently reach a live session.** It is checked when a connection is
+established, so a peer revoked mid-session keeps that session until it ends; restarting
+the relay is the way to drop it. This is a real gap rather than a design choice, and it
+matters most for the case revocation exists to handle — a credential believed to be
+compromised *right now*.
 
 ## Audit events
 

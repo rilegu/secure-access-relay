@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -14,8 +13,8 @@ import (
 	"time"
 
 	"github.com/rilegu/secure-access-relay/internal/agent"
+	"github.com/rilegu/secure-access-relay/internal/ca"
 	"github.com/rilegu/secure-access-relay/internal/operator"
-	"github.com/rilegu/secure-access-relay/internal/relay"
 )
 
 // TestGoldenPath is the done-condition for this phase: an HTTP request travels
@@ -419,21 +418,18 @@ func TestSlowReaderBackpressure(t *testing.T) {
 // several operators at once, and that each operator reaches the endpoint it
 // asked for.
 //
-// Routing correctness is the point. Reaching the wrong device would be a
-// nuisance today and a security failure once grants name a specific endpoint, so
-// each fixture returns a distinct identity and every response is checked against
-// the device that was requested.
+// Routing correctness is the point. Reaching the wrong device would be a nuisance
+// today and a security failure once grants name a specific endpoint, so each
+// fixture returns a distinct identity and every response is checked against the
+// device that was requested.
 func TestManyAgentsAndOperators(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	dep := newDeployment(t)
+	relaySrv := dep.startRelay(ctx, 16)
+	log := discardLogger()
 
-	relaySrv := relay.New(relay.Config{Addr: "127.0.0.1:0", MaxStreams: 16, Logger: log})
-	go func() { _ = relaySrv.Run(ctx) }()
-	waitReady(t, relaySrv.Ready(), "relay")
-
-	// Three endpoints, each with its own fixture reporting its own name.
 	devices := []string{"dev_alpha", "dev_beta", "dev_gamma"}
 	for _, id := range devices {
 		name := id
@@ -444,7 +440,7 @@ func TestManyAgentsAndOperators(t *testing.T) {
 
 		a, err := agent.New(agent.Config{
 			RelayAddr:     relaySrv.Addr(),
-			DeviceID:      name,
+			Identity:      dep.enrollIdentity(ca.RoleDevice, name),
 			Target:        fx.Listener.Addr().String(),
 			RetryInterval: 20 * time.Millisecond,
 			Logger:        log,
@@ -456,14 +452,14 @@ func TestManyAgentsAndOperators(t *testing.T) {
 	}
 	waitForAgent(t, relaySrv, len(devices))
 
-	// One operator forward per device, all against the same relay.
+	// One operator per device, each with its own enrolled identity.
 	forwards := make(map[string]string, len(devices))
 	for _, id := range devices {
 		f, err := operator.New(operator.Config{
 			RelayAddr:  relaySrv.Addr(),
+			Identity:   dep.enrollIdentity(ca.RoleOperator, "usr_"+id),
 			ListenAddr: "127.0.0.1:0",
 			DeviceID:   id,
-			UserID:     "usr_" + id,
 			Resource:   "fixture",
 			Logger:     log,
 		})
@@ -475,8 +471,8 @@ func TestManyAgentsAndOperators(t *testing.T) {
 		forwards[id] = "http://" + f.Addr()
 	}
 
-	// Drive all of them at once, so a routing mistake shows up as a response
-	// from the wrong endpoint rather than being hidden by sequential timing.
+	// Drive all of them at once, so a routing mistake shows up as a response from
+	// the wrong endpoint rather than being hidden by sequential timing.
 	var wg sync.WaitGroup
 	for id, url := range forwards {
 		for i := 0; i < 4; i++ {
@@ -497,8 +493,7 @@ func TestManyAgentsAndOperators(t *testing.T) {
 					return
 				}
 				if string(body) != id {
-					t.Errorf("forward for %s reached %q: the relay routed to the wrong endpoint",
-						id, body)
+					t.Errorf("forward for %s reached %q: the relay routed to the wrong endpoint", id, body)
 				}
 			}(id, url)
 		}
@@ -516,17 +511,15 @@ func TestUnknownDeviceRefused(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-
-	relaySrv := relay.New(relay.Config{Addr: "127.0.0.1:0", Logger: log})
-	go func() { _ = relaySrv.Run(ctx) }()
-	waitReady(t, relaySrv.Ready(), "relay")
+	dep := newDeployment(t)
+	relaySrv := dep.startRelay(ctx, 16)
 
 	f, err := operator.New(operator.Config{
 		RelayAddr:  relaySrv.Addr(),
+		Identity:   dep.enrollIdentity(ca.RoleOperator, "usr_lost"),
 		ListenAddr: "127.0.0.1:0",
 		DeviceID:   "dev_does_not_exist",
-		Logger:     log,
+		Logger:     discardLogger(),
 	})
 	if err != nil {
 		t.Fatalf("create forwarder: %v", err)
