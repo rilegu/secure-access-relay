@@ -4,19 +4,21 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/rilegu/secure-access-relay/internal/bridge"
+	"github.com/rilegu/secure-access-relay/internal/mux"
 	"github.com/rilegu/secure-access-relay/internal/proto"
 	"github.com/rilegu/secure-access-relay/internal/transport"
 )
 
 // Config configures a local forward.
 type Config struct {
-	// RelayAddr is the relay's operator endpoint.
+	// RelayAddr is the relay.
 	RelayAddr string
 
 	// ListenAddr is the local address to accept connections on. Validated as
@@ -25,10 +27,19 @@ type Config struct {
 	// onto the operator's network.
 	ListenAddr string
 
-	// Resource names what to reach on the endpoint. Carried to the agent, which
+	// DeviceID names the endpoint to reach.
+	UserID string
+
+	// Resource names what to reach on that endpoint. Carried to the agent, which
 	// resolves it against its own allowlist. Not an address, and never becomes one
 	// on this side.
 	Resource string
+
+	// DeviceID identifies the endpoint the operator wants.
+	DeviceID string
+
+	KeepAlive   time.Duration
+	IdleTimeout time.Duration
 
 	Logger *slog.Logger
 }
@@ -37,6 +48,11 @@ type Config struct {
 var ErrListenNotLoopback = errors.New("operator: listen address must be loopback")
 
 // Forwarder accepts local connections and carries them through the relay.
+//
+// All local connections share **one** relay session, each becoming a stream on
+// it. That is the point of multiplexing: a session is established once, and
+// opening a forward for a browser that makes six parallel requests costs six
+// streams rather than six connections and six handshakes.
 type Forwarder struct {
 	cfg Config
 	log *slog.Logger
@@ -45,17 +61,29 @@ type Forwarder struct {
 	// wait until the forwarder is quiet.
 	active atomic.Int64
 
-	// ready is closed once the listener is bound, and bound holds the resulting
-	// address. Needed because a caller may ask for port 0 and cannot know the
-	// real port until the listener exists.
 	ready chan struct{}
 	bound atomic.Pointer[string]
+
+	// sessMu guards lazy session establishment. The session is created on first
+	// use and replaced if it dies, so a relay restart does not require restarting
+	// the forward.
+	sessMu sync.Mutex
+	sess   *mux.Session
 }
 
 // New creates a forwarder, rejecting a non-loopback listen address.
 func New(cfg Config) (*Forwarder, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
+	}
+	if cfg.IdleTimeout == 0 {
+		cfg.IdleTimeout = proto.IdleTimeout
+	}
+	if cfg.KeepAlive == 0 {
+		cfg.KeepAlive = cfg.IdleTimeout / 3
+	}
+	if cfg.DeviceID == "" {
+		return nil, errors.New("operator: device id is required")
 	}
 	if err := validateListenAddr(cfg.ListenAddr); err != nil {
 		return nil, err
@@ -99,8 +127,9 @@ func (f *Forwarder) Run(ctx context.Context) error {
 	close(f.ready)
 
 	f.log.Info("forwarding",
-		"listen_addr", ln.Addr().String(),
+		"listen_addr", addr,
 		"relay_addr", f.cfg.RelayAddr,
+		"device_id", f.cfg.DeviceID,
 		"resource", f.cfg.Resource,
 		"secure", false, // no TLS or authentication in this build
 	)
@@ -110,6 +139,8 @@ func (f *Forwarder) Run(ctx context.Context) error {
 		<-ctx.Done()
 		_ = ln.Close()
 	}()
+
+	defer f.closeSession()
 
 	for {
 		local, err := ln.Accept()
@@ -139,123 +170,99 @@ func (f *Forwarder) Addr() string {
 // Active reports how many connections are currently being forwarded.
 func (f *Forwarder) Active() int64 { return f.active.Load() }
 
-// handle carries one local connection through the relay.
+// session returns a live relay session, establishing one if needed.
 //
-// Each local connection gets its own relay connection. That is a simplification
-// of the single-stream phase, not the end state: multiplexing lets many local
-// connections share one relay connection, which is what makes a long-lived
-// session efficient.
+// Dialling is deferred to the first local connection rather than done at startup,
+// so a forward can be opened before the endpoint is online and will work once it
+// arrives. A dead session is replaced on the next attempt, which is what lets a
+// forward survive a relay restart without being restarted itself.
+func (f *Forwarder) session(ctx context.Context) (*mux.Session, error) {
+	f.sessMu.Lock()
+	defer f.sessMu.Unlock()
+
+	if f.sess != nil {
+		select {
+		case <-f.sess.Done():
+			f.sess = nil // died; fall through and redial
+		default:
+			return f.sess, nil
+		}
+	}
+
+	dialCtx, cancel := context.WithTimeout(ctx, proto.DialTimeout)
+	conn, err := transport.Dial(dialCtx, f.cfg.RelayAddr)
+	cancel()
+	if err != nil {
+		return nil, fmt.Errorf("connect to relay: %w", err)
+	}
+
+	sess, err := mux.Dial(ctx, conn, mux.Config{
+		Role:        proto.RoleOperator,
+		KeepAlive:   f.cfg.KeepAlive,
+		IdleTimeout: f.cfg.IdleTimeout,
+		Logger:      f.log,
+	}, proto.Auth{
+		DeviceID: f.cfg.DeviceID,
+		UserID:   f.cfg.UserID,
+		Resource: f.cfg.Resource,
+	})
+	if err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("relay handshake: %w", err)
+	}
+
+	f.log.Info("relay session established", "session_id", sess.ID)
+	f.sess = sess
+	return sess, nil
+}
+
+func (f *Forwarder) closeSession() {
+	f.sessMu.Lock()
+	defer f.sessMu.Unlock()
+	if f.sess != nil {
+		_ = f.sess.Close(proto.ReasonShutdown)
+		f.sess = nil
+	}
+}
+
+// handle carries one local connection through the relay as a single stream.
 func (f *Forwarder) handle(ctx context.Context, local net.Conn) {
 	f.active.Add(1)
 	defer f.active.Add(-1)
-	defer func() { _ = local.Close() }()
 
 	log := f.log.With("local", local.RemoteAddr().String())
 
-	dialCtx, cancel := context.WithTimeout(ctx, proto.DialTimeout)
-	relay, err := transport.Dial(dialCtx, f.cfg.RelayAddr)
-	cancel()
+	sess, err := f.session(ctx)
 	if err != nil {
 		log.Error("cannot reach relay", "error", err)
+		_ = local.Close()
 		return
 	}
-	defer func() { _ = relay.Close() }()
 
-	stop := relay.CloseOnContext(ctx)
-	defer stop()
-
-	// The relay assigns the stream ID. Whatever it puts in the frames it sends
-	// back is authoritative here; this side never invents one.
-	const streamID = 0
-
-	start := time.Now()
-	sent, received, reason := f.pump(relay, local, streamID)
-
-	log.Info("forward closed",
-		"reason", reason.String(),
-		"bytes_sent", sent,
-		"bytes_received", received,
-		"duration_ms", time.Since(start).Milliseconds(),
-	)
-}
-
-// pump moves bytes between the local connection and the relay.
-//
-// As on the agent side, only one direction gets its own goroutine, because the
-// frame Reader must have a single owner.
-func (f *Forwarder) pump(relay *transport.Conn, local net.Conn, streamID uint32) (sent, received int64, reason proto.Reason) {
-	done := make(chan struct{})
-
-	go func() {
-		defer close(done)
-		buf := make([]byte, proto.MaxFramePayload)
-		for {
-			n, err := local.Read(buf)
-			if n > 0 {
-				if werr := relay.W.WriteFrame(proto.TypeStreamData, streamID, buf[:n]); werr != nil {
-					return
-				}
-				sent += int64(n)
-			}
-			if err != nil {
-				// The local client finished. Signal the far end rather than
-				// leaving it waiting for bytes that will never come.
-				_ = relay.W.WriteClose(streamID, proto.ReasonOK)
-				return
-			}
-		}
-	}()
-
-	reason = proto.ReasonOK
-
-	// Labelled so that a write failure inside the switch leaves the read loop.
-	// A bare break would only leave the switch and silently keep reading, which
-	// would spin against a local connection that is already gone.
-readLoop:
-	for {
-		frame, err := relay.R.ReadFrame()
-		if err != nil {
-			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
-				reason = proto.ReasonFor(err)
-			}
-			break readLoop
-		}
-
-		switch frame.Type {
-		case proto.TypeStreamData:
-			if _, werr := local.Write(frame.Payload); werr != nil {
-				break readLoop
-			}
-			received += int64(len(frame.Payload))
-
-		case proto.TypeCloseStream:
-			if r := proto.Reason(frame.Payload); r != "" {
-				reason = r
-			}
-			_ = local.Close()
-			<-done
-			return sent, received, reason
-
-		case proto.TypeError:
-			// A connection-level refusal from the relay: no agent, agent busy, or
-			// the agent could not reach the target. Surfaced verbatim so the
-			// operator sees the real cause.
-			if r := proto.Reason(frame.Payload); r != "" {
-				reason = r
-			}
-			_ = local.Close()
-			<-done
-			return sent, received, reason
-
-		default:
-			reason = proto.ReasonProtocolMalformedFrame
-			_ = local.Close()
-			<-done
-			return sent, received, reason
-		}
+	openCtx, cancel := context.WithTimeout(ctx, proto.DialTimeout)
+	st, err := sess.Open(openCtx)
+	cancel()
+	if err != nil {
+		// The relay refused the stream. Its reason is in the error, and the local
+		// connection is closed so the client sees a prompt failure rather than a
+		// stall.
+		log.Error("relay refused stream", "error", err)
+		_ = local.Close()
+		return
 	}
 
-	_ = local.Close()
-	<-done
-	return sent, received, reason
+	start := time.Now()
+	stats, joinErr := bridge.Join(local, st)
+
+	reason := proto.ReasonOK
+	if joinErr != nil {
+		reason = proto.ReasonShutdown
+	}
+	log.Info("forward closed",
+		"stream_id", st.ID(),
+		"reason", reason.String(),
+		"bytes_sent", stats.AToB,
+		"bytes_received", stats.BToA,
+		"duration_ms", time.Since(start).Milliseconds(),
+	)
 }

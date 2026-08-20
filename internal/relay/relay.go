@@ -2,18 +2,18 @@
 // joins authorized pairs of them.
 //
 // The relay is the component most exposed to the network and therefore the one
-// trusted with the least authority. It holds no signing key, evaluates no
-// policy, and cannot decide that a stream may be opened — it forwards frames
-// between two peers and nothing more. A compromised relay must not be able to
-// reach an endpoint service, which is why the agent verifies authorization
-// itself rather than believing what the relay tells it (invariant 2, threat T2).
+// trusted with the least authority. It holds no signing key, evaluates no policy,
+// and cannot decide that a stream may be opened — it joins two streams and
+// forwards bytes between them. A compromised relay must not be able to reach an
+// endpoint service, which is why the agent verifies authorization itself rather
+// than believing what the relay tells it (invariant 2, threat T2).
 //
 // # Not secure yet
 //
-// This build has no transport encryption, no peer authentication, and no
-// authorization. Anything that can reach the operator port gets a stream. It is
-// a development scaffold for the data path, and must not be exposed to an
-// untrusted network.
+// This build has no transport encryption and no authorization. The identities in
+// a handshake are claims that nothing verifies: any peer may say it is any
+// device. It is a development scaffold and must not be exposed to an untrusted
+// network.
 package relay
 
 import (
@@ -26,24 +26,29 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/rilegu/secure-access-relay/internal/bridge"
+	"github.com/rilegu/secure-access-relay/internal/mux"
 	"github.com/rilegu/secure-access-relay/internal/proto"
 	"github.com/rilegu/secure-access-relay/internal/relay/sessions"
-	"github.com/rilegu/secure-access-relay/internal/relay/streams"
 	"github.com/rilegu/secure-access-relay/internal/transport"
 )
 
 // Config configures a relay server.
 type Config struct {
-	// AgentAddr is where endpoint agents connect.
-	AgentAddr string
-
-	// OperatorAddr is where operator clients connect.
+	// Addr is the single address both agents and operators connect to.
 	//
-	// Two listeners rather than one, because until a handshake exists the relay
-	// needs some way to tell an agent from an operator. Port separation is the
-	// simplest honest answer, and it is replaced by the HELLO/AUTH exchange once
-	// peers can identify themselves cryptographically.
-	OperatorAddr string
+	// One listener, not two: a peer states its role in HELLO, so the relay no
+	// longer needs port separation to tell them apart.
+	Addr string
+
+	// MaxStreams caps concurrent streams per session.
+	MaxStreams uint32
+
+	// KeepAlive and IdleTimeout govern liveness. A dead peer that never sent a
+	// FIN is only detectable by silence, so these are what stop the registry
+	// filling with sessions to hosts that are gone.
+	KeepAlive   time.Duration
+	IdleTimeout time.Duration
 
 	Logger *slog.Logger
 }
@@ -54,19 +59,12 @@ type Server struct {
 	log      *slog.Logger
 	registry *sessions.Registry
 
-	// nextStreamID assigns stream identifiers. Monotonic and never reused within
-	// the process, so a stream ID in a log line refers to exactly one stream.
-	nextStreamID atomic.Uint32
+	nextSession atomic.Uint64
 
-	// listeners are tracked so Shutdown can close them and unblock the accept
-	// loops, which have no other way to be interrupted.
-	mu        sync.Mutex
-	listeners []net.Listener
-	closed    bool
+	mu     sync.Mutex
+	ln     net.Listener
+	closed bool
 
-	// ready is closed once both listeners are bound. Callers that need to know
-	// where the server ended up - anything binding port 0 - must wait on this
-	// first, because the bound address does not exist until Run has started.
 	ready chan struct{}
 }
 
@@ -74,6 +72,15 @@ type Server struct {
 func New(cfg Config) *Server {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
+	}
+	if cfg.MaxStreams == 0 {
+		cfg.MaxStreams = proto.MaxStreamsPerConnection
+	}
+	if cfg.IdleTimeout == 0 {
+		cfg.IdleTimeout = proto.IdleTimeout
+	}
+	if cfg.KeepAlive == 0 {
+		cfg.KeepAlive = cfg.IdleTimeout / 3
 	}
 	return &Server{
 		cfg:      cfg,
@@ -83,85 +90,61 @@ func New(cfg Config) *Server {
 	}
 }
 
-// Run starts both listeners and blocks until ctx is cancelled or a listener
-// fails.
-//
-// Addrs reports the bound addresses once Run has started listening, which is how
-// tests bind to port 0 and still find out where the server ended up.
+// Run listens and serves until ctx is cancelled.
 func (s *Server) Run(ctx context.Context) error {
-	agentLn, err := s.listen(s.cfg.AgentAddr)
+	ln, err := net.Listen("tcp", s.cfg.Addr)
 	if err != nil {
-		return fmt.Errorf("agent listener: %w", err)
-	}
-	operatorLn, err := s.listen(s.cfg.OperatorAddr)
-	if err != nil {
-		_ = agentLn.Close()
-		return fmt.Errorf("operator listener: %w", err)
+		return fmt.Errorf("listen on %s: %w", s.cfg.Addr, err)
 	}
 
-	// Both listeners are bound; the addresses are now readable.
+	s.mu.Lock()
+	s.ln = ln
+	s.mu.Unlock()
 	close(s.ready)
 
 	s.log.Info("relay listening",
-		"agent_addr", agentLn.Addr().String(),
-		"operator_addr", operatorLn.Addr().String(),
+		"addr", ln.Addr().String(),
+		"max_streams", s.cfg.MaxStreams,
 		"secure", false, // stated explicitly so it cannot be assumed otherwise
 	)
 
-	// Cancellation closes the listeners, which is what makes the accept loops
-	// return. Accept has no context-aware form.
+	// Cancellation closes the listener, which is what makes Accept return. There
+	// is no context-aware form of Accept.
 	go func() {
 		<-ctx.Done()
 		s.Shutdown()
 	}()
 
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() { defer wg.Done(); s.acceptAgents(ctx, agentLn) }()
-	go func() { defer wg.Done(); s.acceptOperators(ctx, operatorLn) }()
-	wg.Wait()
-
-	return ctx.Err()
+	for {
+		nc, err := ln.Accept()
+		if err != nil {
+			if s.stopping(ctx, err) {
+				return ctx.Err()
+			}
+			s.log.Warn("accept failed", "error", err)
+			continue
+		}
+		go s.serve(ctx, nc)
+	}
 }
 
-// Ready is closed once both listeners are bound and the addresses are readable.
+// Ready is closed once the listener is bound and Addr is readable.
 func (s *Server) Ready() <-chan struct{} { return s.ready }
+
+// Addr reports the bound address. Valid only after Ready is closed.
+func (s *Server) Addr() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ln == nil {
+		return s.cfg.Addr
+	}
+	return s.ln.Addr().String()
+}
 
 // AgentCount reports how many endpoint agents are connected.
 func (s *Server) AgentCount() int { return s.registry.Count() }
 
-// AgentAddr and OperatorAddr report the bound addresses. Valid only after Ready
-// is closed.
-func (s *Server) AgentAddr() string    { return s.boundAddr(0) }
-func (s *Server) OperatorAddr() string { return s.boundAddr(1) }
-
-func (s *Server) boundAddr(i int) string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if i >= len(s.listeners) {
-		return ""
-	}
-	return s.listeners[i].Addr().String()
-}
-
-func (s *Server) listen(addr string) (net.Listener, error) {
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return nil, err
-	}
-	s.mu.Lock()
-	s.listeners = append(s.listeners, ln)
-	s.mu.Unlock()
-	return ln, nil
-}
-
-// Shutdown stops accepting new connections and closes the ones already
-// established.
-//
-// Connected agents are told the relay is shutting down rather than being left
-// attached to it. An agent that keeps a session open to a stopped relay is
-// unreachable without being aware of it, and will not look for a live relay
-// until something forces the issue.
+// Shutdown stops accepting and closes established agent sessions.
 func (s *Server) Shutdown() {
 	s.mu.Lock()
 	if s.closed {
@@ -169,172 +152,183 @@ func (s *Server) Shutdown() {
 		return
 	}
 	s.closed = true
-	listeners := append([]net.Listener(nil), s.listeners...)
+	ln := s.ln
 	s.mu.Unlock()
 
-	for _, ln := range listeners {
+	if ln != nil {
 		_ = ln.Close()
 	}
 	s.registry.CloseAll(proto.ReasonShutdown)
 }
 
-// acceptAgents handles the endpoint-agent listener.
-func (s *Server) acceptAgents(ctx context.Context, ln net.Listener) {
-	for {
-		nc, err := ln.Accept()
-		if err != nil {
-			if s.stopping(ctx, err) {
-				return
-			}
-			s.log.Warn("agent accept failed", "error", err)
-			continue
-		}
-		go s.serveAgent(ctx, nc)
+// serve handshakes one connection and dispatches on the role it claims.
+func (s *Server) serve(ctx context.Context, nc net.Conn) {
+	conn := transport.NewConn(nc)
+
+	h, err := mux.Accept(ctx, conn, mux.Config{
+		MaxFramePayload: proto.MaxFramePayload,
+		InitialWindow:   proto.InitialWindow,
+		MaxStreams:      s.cfg.MaxStreams,
+		KeepAlive:       s.cfg.KeepAlive,
+		IdleTimeout:     s.cfg.IdleTimeout,
+		Logger:          s.log,
+	})
+	if err != nil {
+		s.log.Debug("handshake failed", "peer", nc.RemoteAddr().String(), "error", err)
+		_ = conn.Close()
+		return
+	}
+
+	switch h.Hello.Role {
+	case proto.RoleAgent:
+		s.serveAgent(ctx, h)
+	case proto.RoleOperator:
+		s.serveOperator(ctx, h)
+	default:
+		// Accept validates the role, so reaching here would mean the validation
+		// and this switch have drifted apart.
+		_ = h.Refuse(proto.ReasonProtocolMalformedFrame)
 	}
 }
 
-// serveAgent registers a connected agent and drives its read loop.
+// serveAgent registers an endpoint agent and holds its session open.
 //
-// The agent identity here is derived from the remote address and carries no
-// authority at all; it exists so log lines can be correlated. Real identity
-// arrives with enrollment and mutual TLS. Nothing in this build should be read as
-// authenticating anything.
-func (s *Server) serveAgent(ctx context.Context, nc net.Conn) {
-	conn := transport.NewConn(nc)
-	agent := sessions.NewAgent(nc.RemoteAddr().String(), conn)
-
-	if replaced := s.registry.Add(agent); replaced != nil {
-		// A reconnect from the same endpoint. Tell the old connection why before
-		// dropping it, so the far end logs a cause rather than a bare EOF.
-		s.log.Info("replacing existing agent session", "agent_id", replaced.ID)
-		_ = replaced.Send(proto.TypeError, 0, []byte(proto.ReasonSessionReplaced))
-		_ = replaced.Close()
+// The device identity here is a claim and nothing more. Until enrollment and
+// mutual TLS exist, any peer can assert any device ID; it is used for routing and
+// log correlation, and must not be read as authentication.
+func (s *Server) serveAgent(ctx context.Context, h *mux.Handshake) {
+	deviceID := h.Auth.DeviceID
+	if deviceID == "" {
+		// A device that will not name itself cannot be routed to.
+		_ = h.Refuse(proto.ReasonAuthFailed)
+		return
 	}
-	s.log.Info("agent connected", "agent_id", agent.ID, "agents", s.registry.Count())
+
+	sessionID := s.newSessionID("age")
+	sess, err := h.Admit(sessionID)
+	if err != nil {
+		s.log.Warn("failed to admit agent", "device_id", deviceID, "error", err)
+		return
+	}
+
+	if replaced := s.registry.Add(deviceID, sess); replaced != nil {
+		s.log.Info("replacing existing agent session", "device_id", deviceID)
+		_ = replaced.Close(proto.ReasonSessionReplaced)
+	}
+
+	log := s.log.With("session_id", sessionID, "device_id", deviceID)
+	log.Info("agent connected", "agents", s.registry.Count())
 
 	defer func() {
-		s.registry.Remove(agent)
-		_ = agent.Close()
-		s.log.Info("agent disconnected", "agent_id", agent.ID, "agents", s.registry.Count())
+		s.registry.Remove(deviceID, sess)
+		_ = sess.Close(proto.ReasonShutdown)
+		log.Info("agent disconnected", "agents", s.registry.Count(), "reason", reasonOf(sess))
 	}()
 
-	// One read loop owns the connection for its whole lifetime. Everything that
-	// needs frames from this agent takes them from the queue it fills, which is
-	// what keeps the connection persistent across successive streams.
-	if err := agent.ReadLoop(ctx); err != nil && !s.stopping(ctx, err) {
-		s.log.Debug("agent read loop ended", "agent_id", agent.ID, "error", err)
+	// The relay opens streams toward an agent and never accepts them from one, so
+	// there is nothing to do here but hold the session until it ends.
+	select {
+	case <-sess.Done():
+	case <-ctx.Done():
 	}
 }
 
-// acceptOperators handles the operator listener. One accepted connection is one
-// stream request.
-func (s *Server) acceptOperators(ctx context.Context, ln net.Listener) {
+// serveOperator joins an operator's streams to the agent it asked for.
+func (s *Server) serveOperator(ctx context.Context, h *mux.Handshake) {
+	deviceID := h.Auth.DeviceID
+	if deviceID == "" {
+		_ = h.Refuse(proto.ReasonAuthFailed)
+		return
+	}
+
+	// Resolved before admitting, so an operator asking for an endpoint that is
+	// not connected is told immediately rather than after a session exists.
+	agentSess, err := s.registry.Get(deviceID)
+	if err != nil {
+		s.log.Info("operator refused",
+			"device_id", deviceID, "user_id", h.Auth.UserID, "reason", proto.ReasonNoAgent.String())
+		_ = h.Refuse(proto.ReasonNoAgent)
+		return
+	}
+
+	sessionID := s.newSessionID("opr")
+	sess, err := h.Admit(sessionID)
+	if err != nil {
+		s.log.Warn("failed to admit operator", "device_id", deviceID, "error", err)
+		return
+	}
+	defer func() { _ = sess.Close(proto.ReasonShutdown) }()
+
+	log := s.log.With(
+		"session_id", sessionID,
+		"device_id", deviceID,
+		"user_id", h.Auth.UserID,
+		"resource", h.Auth.Resource,
+	)
+	log.Info("operator connected")
+	defer log.Info("operator disconnected")
+
+	var wg sync.WaitGroup
+	defer wg.Wait()
+
 	for {
-		nc, err := ln.Accept()
+		st, err := sess.AcceptStream(ctx)
 		if err != nil {
-			if s.stopping(ctx, err) {
-				return
-			}
-			s.log.Warn("operator accept failed", "error", err)
-			continue
+			return
 		}
-		go s.serveOperator(ctx, nc)
+		wg.Add(1)
+		go func(st *mux.Stream) {
+			defer wg.Done()
+			s.joinStream(ctx, log, st, agentSess, h.Auth.Resource)
+		}(st)
 	}
 }
 
-// serveOperator pairs one operator connection with an agent and forwards the
-// stream.
-func (s *Server) serveOperator(ctx context.Context, nc net.Conn) {
-	op := transport.NewConn(nc)
+// joinStream opens a matching stream on the agent and bridges the two.
+func (s *Server) joinStream(ctx context.Context, log *slog.Logger, op *mux.Stream, agentSess *mux.Session, resource string) {
+	log = log.With("operator_stream", op.ID())
 
-	// refuse reports why a stream cannot be served and closes cleanly.
-	//
-	// The drain is what makes the reason arrive. The operator has usually already
-	// sent a request by this point; closing on top of those unread bytes would
-	// reset the connection and destroy the ERROR frame written just above, so the
-	// operator would see a bare connection failure instead of the actual cause.
-	refuse := func(reason proto.Reason) {
-		_ = op.W.WriteError(reason)
-		_ = op.DrainAndClose(2 * time.Second)
-	}
-	defer func() { _ = op.Close() }()
-
-	streamID := s.nextStreamID.Add(1)
-	log := s.log.With("stream_id", streamID, "operator", nc.RemoteAddr().String())
-
-	agent, err := s.registry.Acquire()
+	openCtx, cancel := context.WithTimeout(ctx, proto.DialTimeout+time.Second)
+	agentStream, err := agentSess.Open(openCtx)
+	cancel()
 	if err != nil {
-		// Deny with a reason the operator can act on, and do it before any bytes
-		// move. Note this is an availability failure, not an authorization one:
-		// see sessions.ReasonFor.
-		reason := sessions.ReasonFor(err)
-		log.Info("stream refused", "reason", reason.String())
-		refuse(reason)
-		return
-	}
-	defer s.registry.Release(agent)
-
-	log = log.With("agent_id", agent.ID)
-
-	// Ask the agent to open the stream. The payload names the resource; until a
-	// resource registry exists the agent uses its single configured target and
-	// ignores this value.
-	if err := agent.Send(proto.TypeOpenStream, streamID, nil); err != nil {
-		log.Warn("open stream failed", "error", err)
-		refuse(proto.ReasonNoAgent)
-		return
-	}
-
-	// Wait for the agent to confirm it reached the target, bounded so that an
-	// agent which never answers cannot hold the operator open indefinitely.
-	ackCtx, cancelAck := context.WithTimeout(ctx, proto.DialTimeout+time.Second)
-	ack, err := awaitStreamAck(ackCtx, agent, streamID)
-	cancelAck()
-	if err != nil {
-		log.Warn("no response to open stream", "error", err)
-		// The agent may already have opened its side. Tell it to let go, or it
-		// would sit holding a target connection for a stream nobody will drive.
-		_ = agent.Send(proto.TypeCloseStream, streamID, []byte(proto.ReasonShutdown))
-		refuse(proto.ReasonNoAgent)
-		return
-	}
-
-	switch ack.Type {
-	case proto.TypeStreamOK:
-		// The agent connected to its target. Proceed.
-	case proto.TypeCloseStream, proto.TypeError:
-		// The agent refused. Its reason is forwarded verbatim: the operator needs
-		// to know whether the target was unreachable or the request was denied,
-		// and only the agent knows which. Collapsing these into one code would
-		// leave an operator unable to tell "you may not" from "it is down".
-		reason := proto.Reason(ack.Payload)
-		log.Info("agent refused stream", "reason", reason.String())
-		refuse(reason)
-		return
-	default:
-		log.Warn("unexpected response to open stream", "type", ack.Type.String())
-		_ = agent.Send(proto.TypeCloseStream, streamID, []byte(proto.ReasonProtocolMalformedFrame))
-		refuse(proto.ReasonProtocolMalformedFrame)
+		// The endpoint could not take another stream, or its session died. Either
+		// way this is availability, not authorization, and the operator is told so
+		// rather than being left waiting.
+		reason := proto.ReasonNoAgent
+		if errors.Is(err, mux.ErrTooManyStreams) || errors.Is(err, mux.ErrStreamRefused) {
+			reason = proto.ReasonLimitStreamsExceeded
+		}
+		log.Info("could not open endpoint stream", "reason", reason.String(), "error", err)
+		_ = op.Reset(reason)
 		return
 	}
 
 	start := time.Now()
-	log.Info("stream opened")
+	log.Info("stream joined", "agent_stream", agentStream.ID(), "resource", resource)
 
-	reason, stats := streams.Forward(ctx, streams.ConnPeer{Conn: op}, agent, streamID)
+	stats, joinErr := bridge.Join(op, agentStream)
 
 	// The shape of an audit record: what happened, how much, how long, and why it
 	// ended. Payload contents are deliberately absent (invariant 7).
+	reason := proto.ReasonOK
+	if joinErr != nil {
+		reason = proto.ReasonShutdown
+	}
 	log.Info("stream closed",
 		"reason", reason.String(),
-		"bytes_to_agent", stats.ToAgent,
-		"bytes_to_operator", stats.ToOperator,
+		"bytes_to_agent", stats.AToB,
+		"bytes_to_operator", stats.BToA,
 		"duration_ms", time.Since(start).Milliseconds(),
 	)
 }
 
-// stopping reports whether an accept error means the server is shutting down
-// rather than something worth logging as a failure.
+func (s *Server) newSessionID(prefix string) string {
+	return fmt.Sprintf("%s_%d", prefix, s.nextSession.Add(1))
+}
+
+// stopping reports whether an accept error means shutdown rather than a failure
+// worth logging.
 func (s *Server) stopping(ctx context.Context, err error) bool {
 	if errors.Is(err, net.ErrClosed) {
 		return true
@@ -342,27 +336,10 @@ func (s *Server) stopping(ctx context.Context, err error) bool {
 	return ctx.Err() != nil
 }
 
-// awaitStreamAck waits for the agent's response to OPEN_STREAM for one specific
-// stream.
-//
-// Frames belonging to other streams are discarded rather than accepted as the
-// answer. This is not defensive tidying: an agent's connection is long-lived and
-// a stream that has just finished can still have a CLOSE_STREAM in flight. Taking
-// the first frame that arrives would read that leftover as this stream's reply,
-// report a completed stream as a refusal, and leave the agent holding a target
-// connection for a stream the relay has already given up on. The two ends then
-// disagree about which stream is live, and every subsequent stream is forwarded
-// into a handler that is busy discarding it.
-func awaitStreamAck(ctx context.Context, agent *sessions.Agent, streamID uint32) (proto.Frame, error) {
-	for {
-		f, err := agent.Recv(ctx)
-		if err != nil {
-			return proto.Frame{}, err
-		}
-		if f.StreamID == streamID {
-			return f, nil
-		}
-		// Stale frame from an earlier stream. Dropping it here is what keeps the
-		// two ends in step.
+// reasonOf renders why a session ended, for the closing audit line.
+func reasonOf(sess *mux.Session) string {
+	if err := sess.Err(); err != nil {
+		return err.Error()
 	}
+	return proto.ReasonOK.String()
 }

@@ -39,12 +39,18 @@ type harness struct {
 	ForwardURL string
 }
 
+// testDeviceID is the endpoint identity used throughout these tests. Nothing
+// verifies it; it exists so the relay can route an operator to the right agent.
+const testDeviceID = "dev_test_endpoint"
+
 // options adjusts how a harness is built, for tests that need a broken chain.
 type options struct {
 	// skipAgent leaves no endpoint agent connected, to exercise the refusal path.
 	skipAgent bool
 	// target overrides the agent's target, for pointing it at a dead port.
 	target string
+	// maxStreams overrides the concurrent stream limit.
+	maxStreams uint32
 }
 
 // newHarness starts every component and waits until the chain is ready.
@@ -73,18 +79,26 @@ func newHarness(t *testing.T, opt options) *harness {
 		target = opt.target
 	}
 
+	maxStreams := uint32(16)
+	if opt.maxStreams > 0 {
+		maxStreams = opt.maxStreams
+	}
+
+	// One listener for both roles now; peers state their role in the handshake.
 	h.Relay = relay.New(relay.Config{
-		AgentAddr:    "127.0.0.1:0",
-		OperatorAddr: "127.0.0.1:0",
-		Logger:       log,
+		Addr:       "127.0.0.1:0",
+		MaxStreams: maxStreams,
+		Logger:     log,
 	})
 	go func() { _ = h.Relay.Run(ctx) }()
 	waitReady(t, h.Relay.Ready(), "relay")
 
 	if !opt.skipAgent {
 		a, err := agent.New(agent.Config{
-			RelayAddr:     h.Relay.AgentAddr(),
+			RelayAddr:     h.Relay.Addr(),
+			DeviceID:      testDeviceID,
 			Target:        target,
+			MaxStreams:    maxStreams,
 			RetryInterval: 20 * time.Millisecond, // fast reconnect keeps tests brief
 			Logger:        log,
 		})
@@ -96,8 +110,10 @@ func newHarness(t *testing.T, opt options) *harness {
 	}
 
 	f, err := operator.New(operator.Config{
-		RelayAddr:  h.Relay.OperatorAddr(),
+		RelayAddr:  h.Relay.Addr(),
 		ListenAddr: "127.0.0.1:0",
+		DeviceID:   testDeviceID,
+		UserID:     "usr_test",
 		Resource:   "fixture",
 		Logger:     log,
 	})
@@ -114,10 +130,9 @@ func newHarness(t *testing.T, opt options) *harness {
 
 // client returns an HTTP client that will not reuse connections.
 //
-// Connection reuse would hide bugs: this phase serves one stream at a time, and
-// a pooled connection means a second request might ride a stream that is already
-// open rather than opening a new one. Each request should exercise the full
-// open-and-close path.
+// Connection reuse would hide bugs: each request should exercise the full
+// open-and-close path through a fresh stream rather than riding one that is
+// already established.
 func (h *harness) client(timeout time.Duration) *http.Client {
 	return &http.Client{
 		Timeout:   timeout,

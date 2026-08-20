@@ -49,6 +49,12 @@ const (
 	ReasonProtocolVersionUnsupported Reason = "protocol_version_unsupported"
 	ReasonProtocolMalformedFrame     Reason = "protocol_malformed_frame"
 
+	// ReasonFlowControlViolation means a peer sent more data than the window it
+	// was granted. Distinct from a malformed frame: the frame was well formed,
+	// the peer simply ignored a limit it had been told. Treating it as fatal is
+	// deliberate, because the alternative is buffering without bound.
+	ReasonFlowControlViolation Reason = "flow_control_violation"
+
 	// Connection lifecycle.
 	ReasonAuthFailed      Reason = "auth_failed"
 	ReasonSessionReplaced Reason = "session_replaced"
