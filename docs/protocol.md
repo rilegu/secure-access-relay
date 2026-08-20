@@ -204,27 +204,63 @@ an operator session. No endpoint accepts a target address; the operator names a
 
 ## Grant format
 
-Ed25519 over a canonical encoding of:
+A grant is signed with Ed25519 over a **binary canonical encoding**, not over JSON. The
+wire form is those bytes followed by the 64-byte signature.
 
 ```
-{
-  "v":            1,
-  "issuer":       "<control-plane key id>",
-  "grant_id":     "grn_...",
-  "org_id":       "org_...",
-  "user_id":      "usr_...",
-  "device_id":    "dev_...",
-  "resource_id":  "res_...",
-  "issued_at":    "2026-08-19T14:30:00Z",
-  "expires_at":   "2026-08-19T15:00:00Z",
-  "max_bytes":    1073741824
-}
+  u8    version            1
+  str   key id             which signing key issued this
+  str   grant id           grn_...
+  str   org id
+  str   user id
+  str   device id
+  str   resource id
+  u64   issued at          unix seconds, big-endian
+  u64   expires at         unix seconds, big-endian
+  u64   max bytes          0 means the resource's own limit applies
+
+  str = u16 length prefix + UTF-8 bytes
 ```
 
-Not JWT: the claim set is fixed, the algorithm is fixed, and there is no `alg` field to
-confuse. Canonical encoding is defined in `internal/proto` and covered by round-trip and
-tamper tests. Verification requires all fields present; unknown fields are rejected
-rather than ignored.
+Every field is fixed-width or length-prefixed, the order is exactly the order above, and
+nothing is optional. Trailing bytes are a malformed grant, not something to ignore.
+
+**Why not JSON.** A signature is over bytes, and JSON has many valid encodings of the same
+value — key order, whitespace, unicode escaping, number formatting. A verifier that parses
+and re-encodes before checking can produce different bytes from the value it is about to
+act on, which is the shape of real signature-bypass bugs. See
+[ADR-0013](decisions/0013-canonical-grant-encoding.md).
+
+**Why not JWT.** The claim set is fixed, the algorithm is fixed, and there is no `alg`
+field for a verifier to get wrong. See
+[ADR-0003](decisions/0003-ed25519-grants-not-jwt.md).
+
+Times are truncated to whole seconds before signing, because the encoding cannot represent
+finer precision — signing a value the wire format cannot reproduce would make every grant
+fail its own verification.
+
+### Verification order
+
+The signature is checked **first**. Every other field is attacker-controlled until it has
+been, so nothing in a grant means anything before then. After that:
+
+1. Lifetime does not exceed the thirty-minute ceiling — checked here as well as at issue,
+   so a verifier does not depend on the issuer having behaved.
+2. Not before `issued_at`, allowing bounded clock skew.
+3. Not after `expires_at`, allowing the same.
+4. `device_id` matches the verifying agent's own identity, which is what stops a grant
+   captured at one endpoint being replayed at another.
+
+The agent then resolves `resource_id` against its **own** allowlist and confirms the
+target is loopback. A correctly signed grant for a resource the agent does not serve is
+refused.
+
+### Where a grant travels
+
+The grant is the payload of the `OPEN_STREAM` frame. The operator obtains one from the
+control plane, presents it when opening a stream, and the relay forwards the same bytes
+unchanged to the agent — it does not re-sign, re-encode, or amend anything, because the
+agent must verify exactly what the control plane issued.
 
 ## Implementation status
 
@@ -242,7 +278,7 @@ the gaps are load-bearing enough to state rather than leave a reader to infer.
 | Multiple concurrent streams | implemented |
 | Reason codes | implemented |
 | TLS | **not implemented** |
-| Grants and policy | **not implemented** |
+| Grants and policy | implemented — see [ADR-0013](decisions/0013-canonical-grant-encoding.md) |
 
 **AUTH does not establish identity; the certificate does.** Every data-plane connection
 is mutual TLS, and the relay reads a peer's identity from a URI in its certificate before
@@ -253,8 +289,13 @@ and a disagreement ends the connection — see
 AUTH still carries one thing that is *not* an identity claim: the device an operator
 wants to reach. That is a request, and it is answered by the relay rather than believed.
 
-The gap that matters most now is **authorization**. Identity says who a peer is; nothing
-yet says what it may do, so any enrolled operator may reach any enrolled device.
+Authorization now exists: a stream carries a signed grant in its `OPEN_STREAM` payload,
+and the endpoint agent verifies it before dialing. The grant names a resource, never an
+address — the agent resolves the identifier against its own allowlist.
+
+The gap that matters most now is the **record**. Every decision is logged with the
+identifiers needed to reconstruct it, but there is no queryable append-only audit trail,
+nothing is tamper-evident, and a grant cannot be revoked before it expires.
 
 Because a peer now states its role in `HELLO`, the relay serves both agents and operators
 on **one listener**. The separate ports used before this existed are gone.

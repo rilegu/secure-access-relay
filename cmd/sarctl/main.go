@@ -114,17 +114,22 @@ func cmdEnroll(args []string) error {
 func cmdConnect(args []string) error {
 	fs := flag.NewFlagSet("connect", flag.ExitOnError)
 	var (
-		relayAddr = fs.String("relay-addr", "127.0.0.1:17070", "relay address to connect out to")
-		stateDir  = fs.String("state-dir", "operator-state", "directory holding the key and certificate")
-		listen    = fs.String("listen", "127.0.0.1:18080", "local address to accept connections on; must be loopback")
-		device    = fs.String("device", "", "identifier of the endpoint to reach (required)")
-		resource  = fs.String("resource", "default", "name of the resource to reach on the endpoint")
-		logLevel  = fs.String("log-level", "info", "log level: debug, info, warn, error")
+		relayAddr   = fs.String("relay-addr", "127.0.0.1:17070", "relay address to connect out to")
+		controlAddr = fs.String("control-addr", "127.0.0.1:17071", "control-plane address where grants are requested")
+		stateDir    = fs.String("state-dir", "operator-state", "directory holding the key and certificate")
+		listen      = fs.String("listen", "127.0.0.1:18080", "local address to accept connections on; must be loopback")
+		device      = fs.String("device", "", "identifier of the endpoint to reach (required)")
+		resource    = fs.String("resource", "", "identifier of the resource to reach on the endpoint (required)")
+		ttl         = fs.Duration("ttl", 20*time.Minute, "grant lifetime to request; the control plane caps it by policy")
+		logLevel    = fs.String("log-level", "info", "log level: debug, info, warn, error")
 	)
 	_ = fs.Parse(args)
 
 	if *device == "" {
 		return errors.New("a device is required")
+	}
+	if *resource == "" {
+		return errors.New("a resource is required")
 	}
 
 	log := logging.New(*logLevel)
@@ -141,12 +146,14 @@ func cmdConnect(args []string) error {
 	// routable interface would republish someone else's private service onto the
 	// operator's own network.
 	f, err := operator.New(operator.Config{
-		RelayAddr:  *relayAddr,
-		Identity:   id,
-		ListenAddr: *listen,
-		DeviceID:   *device,
-		Resource:   *resource,
-		Logger:     log,
+		RelayAddr:   *relayAddr,
+		ControlAddr: *controlAddr,
+		Identity:    id,
+		ListenAddr:  *listen,
+		DeviceID:    *device,
+		Resource:    *resource,
+		GrantTTL:    *ttl,
+		Logger:      log,
 	})
 	if err != nil {
 		return err

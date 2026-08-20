@@ -62,7 +62,8 @@ tunnel with authentication.
 
 ## Evaluation
 
-Executed at the control plane when a grant is requested:
+**Implemented** in `internal/control/policy`. Executed at the control plane when a grant
+is requested:
 
 ```
 1. Resolve operator identity        -> usr_, group memberships
@@ -80,7 +81,10 @@ re-verifies it on every stream open.
 
 ## Enforcement points
 
-Both of these run, always. This is not redundancy to be optimized away.
+Both of these run, always, and both are implemented. This is not redundancy to be
+optimized away: the agent's check is what makes a compromised relay survivable, and the
+relay's check exists only so an operator learns immediately why a request was refused
+rather than after a round trip to a machine that was never going to accept it.
 
 | Point | Location | Checks |
 | ----- | -------- | ------ |

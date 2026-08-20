@@ -14,6 +14,7 @@ import (
 
 	"github.com/rilegu/secure-access-relay/internal/agent"
 	"github.com/rilegu/secure-access-relay/internal/ca"
+	"github.com/rilegu/secure-access-relay/internal/control/policy"
 	"github.com/rilegu/secure-access-relay/internal/operator"
 )
 
@@ -427,10 +428,27 @@ func TestManyAgentsAndOperators(t *testing.T) {
 	t.Cleanup(cancel)
 
 	dep := newDeployment(t)
+
+	devices := []string{"dev_alpha", "dev_beta", "dev_gamma"}
+
+	// One rule per device, each naming only its own operator and resource. A
+	// routing mistake and an authorization mistake would both show up here.
+	dep.rules = nil
+	for _, id := range devices {
+		dep.rules = append(dep.rules, policy.Rule{
+			PolicyID:   "pol_" + id,
+			Principals: []string{"usr_" + id},
+			Devices:    []string{id},
+			Resources:  []string{testResourceID},
+			MaxTTL:     policy.Duration(10 * time.Minute),
+			Effect:     policy.EffectAllow,
+		})
+	}
+
+	dep.startControlPlane(ctx)
 	relaySrv := dep.startRelay(ctx, 16)
 	log := discardLogger()
 
-	devices := []string{"dev_alpha", "dev_beta", "dev_gamma"}
 	for _, id := range devices {
 		name := id
 		fx := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -441,7 +459,7 @@ func TestManyAgentsAndOperators(t *testing.T) {
 		a, err := agent.New(agent.Config{
 			RelayAddr:     relaySrv.Addr(),
 			Identity:      dep.enrollIdentity(ca.RoleDevice, name),
-			Target:        fx.Listener.Addr().String(),
+			Resources:     testAllowlist(fx.Listener.Addr().String()),
 			RetryInterval: 20 * time.Millisecond,
 			Logger:        log,
 		})
@@ -456,12 +474,13 @@ func TestManyAgentsAndOperators(t *testing.T) {
 	forwards := make(map[string]string, len(devices))
 	for _, id := range devices {
 		f, err := operator.New(operator.Config{
-			RelayAddr:  relaySrv.Addr(),
-			Identity:   dep.enrollIdentity(ca.RoleOperator, "usr_"+id),
-			ListenAddr: "127.0.0.1:0",
-			DeviceID:   id,
-			Resource:   "fixture",
-			Logger:     log,
+			RelayAddr:   relaySrv.Addr(),
+			ControlAddr: dep.controlAddr,
+			Identity:    dep.enrollIdentity(ca.RoleOperator, "usr_"+id),
+			ListenAddr:  "127.0.0.1:0",
+			DeviceID:    id,
+			Resource:    testResourceID,
+			Logger:      log,
 		})
 		if err != nil {
 			t.Fatalf("create forwarder for %s: %v", id, err)
@@ -512,14 +531,25 @@ func TestUnknownDeviceRefused(t *testing.T) {
 	t.Cleanup(cancel)
 
 	dep := newDeployment(t)
+	dep.rules = []policy.Rule{{
+		PolicyID:   "pol_lost",
+		Principals: []string{"usr_lost"},
+		Devices:    []string{"dev_does_not_exist"},
+		Resources:  []string{testResourceID},
+		MaxTTL:     policy.Duration(5 * time.Minute),
+		Effect:     policy.EffectAllow,
+	}}
+	dep.startControlPlane(ctx)
 	relaySrv := dep.startRelay(ctx, 16)
 
 	f, err := operator.New(operator.Config{
-		RelayAddr:  relaySrv.Addr(),
-		Identity:   dep.enrollIdentity(ca.RoleOperator, "usr_lost"),
-		ListenAddr: "127.0.0.1:0",
-		DeviceID:   "dev_does_not_exist",
-		Logger:     discardLogger(),
+		RelayAddr:   relaySrv.Addr(),
+		ControlAddr: dep.controlAddr,
+		Identity:    dep.enrollIdentity(ca.RoleOperator, "usr_lost"),
+		ListenAddr:  "127.0.0.1:0",
+		DeviceID:    "dev_does_not_exist",
+		Resource:    testResourceID,
+		Logger:      discardLogger(),
 	})
 	if err != nil {
 		t.Fatalf("create forwarder: %v", err)

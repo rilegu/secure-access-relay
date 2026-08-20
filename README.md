@@ -178,8 +178,20 @@ performed for a target** — a resource pinned to `127.0.0.1` cannot be moved by
 answer. A misconfigured allowlist produces a failed startup, never a running agent.
 
 **The relay is untrusted for authorization.** It joins streams and forwards bytes
-opaquely. It holds no key material and makes no access decision. When grants land, the
-agent verifies them itself, so a compromised relay still cannot reach a service.
+opaquely, holds no signing key, and makes no access decision. It does check a grant, but
+only to fail fast — the endpoint agent verifies the same grant independently, against a
+key it obtained at enrollment, before it dials anything. A compromised relay can ask, and
+be refused.
+
+**An operator names a resource; the agent resolves it.** The grant carries a resource
+identifier, never an address. The agent looks it up in its own local allowlist and refuses
+anything not declared there — so an authorization bug cannot become "reach anything you
+can name". A resource file with a non-loopback target stops the agent starting.
+
+**Grants expire, and expiry is enforced on running sessions.** A stream is closed when its
+grant lapses, not merely refused at the moment it opens. Thirty minutes is the ceiling
+regardless of what a policy asks for, checked both when a grant is issued and again when
+it is verified — so a compromised issuer cannot mint a year-long one.
 
 **Deny by default, with distinguishable reasons.** Every refusal carries a stable reason
 code. `target_connection_refused` is never reported as `policy_denied` — an operator must
@@ -213,9 +225,12 @@ keeping, not the number.
 
 ## Status
 
-**Transport and identity work; authorization does not.** Every connection is mutual TLS
-and every peer is an enrolled identity proved by certificate. What is missing is policy:
-any enrolled operator may reach any enrolled device, because grants do not exist yet.
+**This is now a resource proxy.** Every connection is mutual TLS, every peer is an
+enrolled identity proved by certificate, and every stream requires a signed, expiring
+grant that the endpoint agent verifies for itself before it dials anything.
+
+What is missing is the record: there is no queryable audit trail yet, and grants cannot
+be revoked before they expire.
 
 | Capability | State |
 | ---------- | ----- |
@@ -233,12 +248,17 @@ any enrolled operator may reach any enrolled device, because grants do not exist
 | Certificate-bound identity and roles | working |
 | Revocation and certificate supersession | working |
 | Device key sealed with DPAPI (Windows) | working |
+| Named resources declared by the agent | working |
+| Policy engine, deny by default | working |
+| Ed25519-signed time-bound grants | working |
+| Agent verifies grants independently | working |
 | Windows Service with restart-on-failure | working |
 | Windows Event Log for operational events | working |
 | PowerShell installer with ACL-protected state | working |
-| Named resources and signed time-bound grants | not implemented |
 | End-to-end encryption between operator and agent | not implemented |
-| Operator login and audit trail | not implemented |
+| Operator login flow | not implemented |
+| Queryable audit trail | not implemented |
+| Grant revocation before expiry | not implemented |
 | WFP leak guard | not implemented |
 | Native diagnostics library | not implemented |
 
@@ -316,12 +336,35 @@ native diagnostics library will use.
 
 Everything on one machine. Nothing listens on a routable interface except the relay.
 
+**1. Say what the endpoint serves.** `resources.json`, read by the agent:
+
+```json
+[{ "resource_id": "res_diagnostics", "name": "panel diagnostics",
+   "protocol": "tcp", "target": "127.0.0.1:8080",
+   "max_bytes": 104857600, "max_duration": "20m" }]
+```
+
+A non-loopback target here stops the agent starting. The operator never sees this file;
+they name `res_diagnostics` and the agent resolves it.
+
+**2. Say who may reach it.** `policy.json`, in the server's state directory:
+
+```json
+[{ "policy_id": "pol_support", "principals": ["maria"],
+   "devices": ["panel-lab-01"], "resources": ["res_diagnostics"],
+   "max_ttl": "20m", "effect": "allow" }]
+```
+
+Allow-only, no wildcards, exact matches. No policy file means nothing is reachable.
+
+**3. Run it.**
+
 ```sh
 make build
 
 # Mint single-use enrollment codes. The first call creates the authority.
-./bin/sar-server token -device panel-lab-01     # prints a code for the endpoint
-./bin/sar-server token -operator maria          # prints a code for the operator
+./bin/sar-server token -device panel-lab-01
+./bin/sar-server token -operator maria
 
 # Start the control plane and relay.
 ./bin/sar-server run
@@ -335,10 +378,10 @@ make build
 go run ./testdata/fixtures/httpfixture.go -addr 127.0.0.1:8080
 
 # The endpoint agent. Dials out; never listens.
-./bin/sar-agent run -target 127.0.0.1:8080
+./bin/sar-agent run -resources resources.json
 
-# The operator forward. Names the endpoint it wants; never an address.
-./bin/sarctl connect -device panel-lab-01 -resource diagnostics -listen 127.0.0.1:18080
+# The operator forward. Requests a grant, then carries traffic under it.
+./bin/sarctl connect -device panel-lab-01 -resource res_diagnostics -listen 127.0.0.1:18080
 ```
 
 Then:
@@ -348,15 +391,36 @@ curl http://127.0.0.1:18080/health
 ```
 
 The request travels `curl -> sarctl -> relay -> agent -> 127.0.0.1:8080` and back, over
-mutual TLS between each pair. The fixture is never reachable from outside the machine,
-and the protected machine opens no inbound port.
+mutual TLS between each pair, under a grant the agent verified for itself.
 
-To see the enforcement, point things where they must not go:
+The server log records the decision:
+
+```
+"msg":"grant issued"  user_id=maria device_id=panel-lab-01
+                      resource_id=res_diagnostics policy_id=pol_support
+                      expires_at=2026-08-20T21:01:31Z
+```
+
+and the agent records enforcing it:
+
+```
+"msg":"stream authorized"  grant_id=grn_1142... resource_id=res_diagnostics
+                           target=127.0.0.1:8080 expires_in_s=1199
+```
+
+To see the enforcement, ask for something no policy allows:
+
+```sh
+./bin/sarctl connect -device panel-lab-01 -resource res_not_allowed -listen 127.0.0.1:18081
+# grant refused: policy_denied — no stream is ever opened
+```
+
+Or point things where they must not go:
 
 ```sh
 ./bin/sar-agent run -target 192.168.1.10:8080         # refuses to start: must be loopback
 ./bin/sar-agent run -target localhost:8080            # refuses to start: names are not resolved
-./bin/sarctl connect -device x -listen 0.0.0.0:18080  # refuses to start: must be loopback
+./bin/sarctl connect -device x -resource y -listen 0.0.0.0:18080  # refuses: must be loopback
 ./bin/sar-agent enroll -code <an already used code>   # refused: tokens are single use
 ```
 

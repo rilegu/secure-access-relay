@@ -240,7 +240,7 @@ func TestAgentRefusesUntrustedRelay(t *testing.T) {
 	a, err := agent.New(agent.Config{
 		RelayAddr:     hostileRelay.Addr(),
 		Identity:      ours.enrollIdentity(ca.RoleDevice, "dev_ours"),
-		Target:        "127.0.0.1:1",
+		Resources:     testAllowlist("127.0.0.1:1"),
 		RetryInterval: 20 * time.Millisecond,
 		Logger:        discardLogger(),
 	})
@@ -267,12 +267,15 @@ func TestOperatorRefusesUntrustedRelay(t *testing.T) {
 	hostileRelay := hostile.startRelay(ctx, 16)
 
 	ours := newDeployment(t)
+	ours.startControlPlane(ctx)
 	f, err := operator.New(operator.Config{
-		RelayAddr:  hostileRelay.Addr(),
-		Identity:   ours.enrollIdentity(ca.RoleOperator, "usr_ours"),
-		ListenAddr: "127.0.0.1:0",
-		DeviceID:   "dev_anything",
-		Logger:     discardLogger(),
+		RelayAddr:   hostileRelay.Addr(),
+		ControlAddr: ours.controlAddr,
+		Identity:    ours.enrollIdentity(ca.RoleOperator, testUserID),
+		ListenAddr:  "127.0.0.1:0",
+		DeviceID:    "dev_anything",
+		Resource:    testResourceID,
+		Logger:      discardLogger(),
 	})
 	if err != nil {
 		t.Fatalf("create forwarder: %v", err)

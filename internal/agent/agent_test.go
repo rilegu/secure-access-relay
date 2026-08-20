@@ -2,7 +2,10 @@ package agent
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/rilegu/secure-access-relay/internal/identity"
 )
@@ -83,10 +86,82 @@ func TestNewRejectsBadTarget(t *testing.T) {
 	_, err := New(Config{
 		RelayAddr: "127.0.0.1:1",
 		Identity:  &identity.Identity{},
-		Target:    "192.168.1.10:8080",
+		Resources: Allowlist{
+			"res_bad": {ResourceID: "res_bad", Protocol: "tcp", Target: "192.168.1.10:8080"},
+		},
 	})
 	if !errors.Is(err, ErrTargetNotLoopback) {
 		t.Fatalf("New with a LAN target returned %v, want ErrTargetNotLoopback", err)
+	}
+}
+
+// TestNewRequiresGrantKey checks the agent will not start without the key it
+// needs to verify grants.
+//
+// An agent that could authenticate but not authorize would have to take the
+// relay's word for what is permitted, which is exactly what invariant 2 forbids.
+// Refusing to start is the only safe response.
+func TestNewRequiresGrantKey(t *testing.T) {
+	_, err := New(Config{
+		RelayAddr: "127.0.0.1:1",
+		Identity:  &identity.Identity{}, // no GrantKey
+		Resources: Allowlist{
+			"res_ok": {ResourceID: "res_ok", Protocol: "tcp", Target: "127.0.0.1:8080"},
+		},
+	})
+	if err == nil {
+		t.Fatal("New succeeded without a grant verification key")
+	}
+}
+
+// TestLoadAllowlistRejectsBadResources checks that a misconfigured resource file
+// stops the agent rather than being tolerated.
+func TestLoadAllowlistRejectsBadResources(t *testing.T) {
+	cases := map[string]string{
+		"non-loopback target": `[{"resource_id":"a","protocol":"tcp","target":"192.168.1.5:80"}]`,
+		"hostname target":     `[{"resource_id":"a","protocol":"tcp","target":"localhost:80"}]`,
+		"no port":             `[{"resource_id":"a","protocol":"tcp","target":"127.0.0.1"}]`,
+		"wrong protocol":      `[{"resource_id":"a","protocol":"udp","target":"127.0.0.1:80"}]`,
+		"no resource id":      `[{"protocol":"tcp","target":"127.0.0.1:80"}]`,
+		"duplicate id":        `[{"resource_id":"a","protocol":"tcp","target":"127.0.0.1:80"},{"resource_id":"a","protocol":"tcp","target":"127.0.0.1:81"}]`,
+		"unknown field":       `[{"resource_id":"a","protocol":"tcp","target":"127.0.0.1:80","allow_lan":true}]`,
+		"empty list":          `[]`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "resources.json")
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadAllowlist(path); err == nil {
+				t.Fatalf("%s was accepted; a misconfigured allowlist must stop the agent starting", name)
+			}
+		})
+	}
+}
+
+func TestLoadAllowlistAcceptsValid(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "resources.json")
+	body := `[{"resource_id":"res_diag","name":"diagnostics","protocol":"tcp",` +
+		`"target":"127.0.0.1:8080","max_bytes":1048576,"max_duration":"20m"}]`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	list, err := LoadAllowlist(path)
+	if err != nil {
+		t.Fatalf("LoadAllowlist: %v", err)
+	}
+	r, err := list.Lookup("res_diag")
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+	if r.Target != "127.0.0.1:8080" || r.MaxBytes != 1048576 || r.MaxDuration.Duration() != 20*time.Minute {
+		t.Fatalf("resource did not round-trip: %+v", r)
+	}
+
+	if _, err := list.Lookup("res_absent"); !errors.Is(err, ErrResourceUnknown) {
+		t.Fatalf("Lookup of an undeclared resource returned %v, want ErrResourceUnknown", err)
 	}
 }
 
@@ -96,7 +171,13 @@ func TestNewRejectsBadTarget(t *testing.T) {
 // by the relay during the TLS handshake anyway. Failing at construction turns a
 // confusing connection error into a clear instruction to enroll.
 func TestNewRequiresIdentity(t *testing.T) {
-	if _, err := New(Config{RelayAddr: "127.0.0.1:1", Target: "127.0.0.1:8080"}); err == nil {
+	cfg := Config{
+		RelayAddr: "127.0.0.1:1",
+		Resources: Allowlist{
+			"res_ok": {ResourceID: "res_ok", Protocol: "tcp", Target: "127.0.0.1:8080"},
+		},
+	}
+	if _, err := New(cfg); err == nil {
 		t.Fatal("New succeeded without an identity")
 	}
 }

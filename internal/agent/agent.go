@@ -27,12 +27,13 @@ type Config struct {
 	// will not admit it.
 	Identity *identity.Identity
 
-	// Target is the local service this agent is willing to reach.
+	// Resources is the local allowlist: the only services this agent will ever
+	// reach, keyed by resource identifier.
 	//
-	// One fixed target for now. It becomes a named resource in a local allowlist
-	// once the resource registry exists; the loopback restriction does not change
-	// when that happens.
-	Target string
+	// An operator names a resource; the agent resolves it here. The address never
+	// crosses the wire, which is what makes an authorization bug unable to become
+	// "reach anything you can name".
+	Resources Allowlist
 
 	// MaxStreams caps concurrent streams the relay may open on this agent.
 	MaxStreams uint32
@@ -83,8 +84,22 @@ func New(cfg Config) (*Agent, error) {
 	if cfg.Identity == nil {
 		return nil, errors.New("agent: not enrolled; run enroll first")
 	}
-	if err := ValidateTarget(cfg.Target); err != nil {
-		return nil, err
+	if len(cfg.Resources) == 0 {
+		return nil, errors.New("agent: no resources declared; an agent with nothing to serve would refuse every stream")
+	}
+	// Re-validated here even though LoadAllowlist already checked, because an
+	// allowlist can also be constructed in code. Invariant 4 has to hold however
+	// the configuration arrived.
+	for id, r := range cfg.Resources {
+		if err := ValidateTarget(r.Target); err != nil {
+			return nil, fmt.Errorf("resource %q: %w", id, err)
+		}
+	}
+	if cfg.Identity.GrantKey == nil {
+		// Without the verification key the agent could authenticate but not
+		// authorize, and would have to take the relay's word for what is allowed.
+		// Refusing to start is the only safe response.
+		return nil, errors.New("agent: no grant verification key; re-enroll to obtain one")
 	}
 	return &Agent{cfg: cfg, log: cfg.Logger}, nil
 }
@@ -180,7 +195,7 @@ func (a *Agent) session(ctx context.Context) error {
 		"relay_addr", a.cfg.RelayAddr,
 		"session_id", sess.ID,
 		"device_id", a.cfg.Identity.ID.ID,
-		"target", a.cfg.Target,
+		"resources", a.cfg.Resources.IDs(),
 		"mutual_tls", true,
 		"key_protection", string(a.cfg.Identity.Protection),
 	)
@@ -199,45 +214,122 @@ func (a *Agent) session(ctx context.Context) error {
 	}
 }
 
-// handleStream connects one stream to the local target.
+// handleStream authorizes one stream and, only if it passes, connects it.
+//
+// This is the enforcement point the whole system exists to place here. The relay
+// asked for a stream and handed over a grant; nothing the relay said is trusted.
+// The agent checks the signature itself, against a key it obtained at
+// enrollment, and resolves the resource against its own allowlist. A compromised
+// relay can therefore ask, and be refused.
+//
+// The order is deliberate: signature first, because every other field is
+// attacker-controlled until it verifies; then expiry and device; then the
+// resource; and only then a socket.
 func (a *Agent) handleStream(ctx context.Context, st *mux.Stream) {
-	log := a.log.With("stream_id", st.ID(), "target", a.cfg.Target)
+	log := a.log.With("stream_id", st.ID())
 
-	// Re-validated on every stream, not only at startup. Configuration can be
-	// reloaded, and the loopback rule has to hold at the moment of use rather
-	// than only at the moment it was last read.
-	if err := ValidateTarget(a.cfg.Target); err != nil {
-		log.Error("refusing stream: invalid target", "error", err)
-		_ = st.Reset(proto.ReasonResourceTargetNotLoopback)
+	payload := st.OpenPayload()
+	if len(payload) == 0 {
+		// No grant at all. Before this phase the relay could open a stream simply
+		// by asking; now that is a refusal.
+		log.Warn("refusing stream: no grant presented")
+		_ = st.Reset(proto.ReasonPolicyDenied)
 		return
 	}
 
-	dialCtx, cancel := context.WithTimeout(ctx, proto.DialTimeout)
-	var d net.Dialer
-	target, err := d.DialContext(dialCtx, "tcp", a.cfg.Target)
-	cancel()
+	grant, err := proto.DecodeGrant(payload)
 	if err != nil {
-		// A target that is not listening is an availability problem, not an
-		// authorization one, and gets a distinct code so the operator can tell the
-		// difference without reading logs.
+		log.Warn("refusing stream: grant did not decode", "error", err)
+		_ = st.Reset(proto.ReasonForGrant(err))
+		return
+	}
+
+	// Verify against this agent's own identity. The device identifier is inside
+	// the signature, so a grant captured at another endpoint cannot be replayed
+	// here (threat T6).
+	if err := grant.Verify(a.cfg.Identity.GrantKey, time.Now(), a.cfg.Identity.ID.ID); err != nil {
+		reason := proto.ReasonForGrant(err)
+		log.Warn("refusing stream: grant rejected",
+			"reason", reason.String(), "grant_id", grant.GrantID, "error", err)
+		_ = st.Reset(reason)
+		return
+	}
+
+	log = log.With("grant_id", grant.GrantID, "user_id", grant.UserID, "resource_id", grant.ResourceID)
+
+	resource, err := a.cfg.Resources.Lookup(grant.ResourceID)
+	if err != nil {
+		// A correctly signed grant for something this agent does not serve. The
+		// control plane and the agent disagree about what exists here, and the
+		// agent's view is the one that decides.
+		reason := proto.ReasonResourceUnknown
+		if errors.Is(err, ErrTargetNotLoopback) {
+			reason = proto.ReasonResourceTargetNotLoopback
+		}
+		log.Warn("refusing stream: resource not available", "reason", reason.String(), "error", err)
+		_ = st.Reset(reason)
+		return
+	}
+
+	// The session may not outlive the grant. Whichever is shorter — what remains
+	// of the grant, or the resource's own limit — bounds it, so an operator
+	// cannot hold a connection open past the authorization that opened it.
+	deadline := time.Now().Add(grant.Remaining(time.Now()))
+	if d := resource.MaxDuration.Duration(); d > 0 && time.Now().Add(d).Before(deadline) {
+		deadline = time.Now().Add(d)
+	}
+	streamCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+
+	dialCtx, dialCancel := context.WithTimeout(streamCtx, proto.DialTimeout)
+	var d net.Dialer
+	target, err := d.DialContext(dialCtx, "tcp", resource.Target)
+	dialCancel()
+	if err != nil {
+		// The target being down is an availability problem, not an authorization
+		// one, and gets a distinct code so an operator can tell "you may not" from
+		// "it is not answering" without reading logs.
 		reason := proto.ReasonTargetConnectionRefused
 		if errors.Is(err, context.DeadlineExceeded) {
 			reason = proto.ReasonTargetTimeout
 		}
-		log.Info("target unreachable", "reason", reason.String(), "error", err)
+		log.Info("target unreachable", "reason", reason.String(), "target", resource.Target, "error", err)
 		_ = st.Reset(reason)
 		return
 	}
 
 	start := time.Now()
-	log.Info("stream opened")
+	log.Info("stream authorized",
+		"target", resource.Target,
+		"expires_in_s", int(grant.Remaining(start).Seconds()),
+	)
+
+	// Closing the stream when the deadline passes is what actually enforces
+	// expiry on a session already running. Without it, a grant would bound when a
+	// stream may *start* and nothing would bound how long it lasts.
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-streamCtx.Done():
+			if ctx.Err() == nil {
+				_ = st.Reset(proto.ReasonGrantExpired)
+				_ = target.Close()
+			}
+		case <-done:
+		}
+	}()
 
 	stats, joinErr := bridge.Join(st, target)
 
 	reason := proto.ReasonOK
-	if joinErr != nil {
+	switch {
+	case streamCtx.Err() == context.DeadlineExceeded:
+		reason = proto.ReasonGrantExpired
+	case joinErr != nil:
 		reason = proto.ReasonShutdown
 	}
+
 	log.Info("stream closed",
 		"reason", reason.String(),
 		"bytes_to_target", stats.AToB,

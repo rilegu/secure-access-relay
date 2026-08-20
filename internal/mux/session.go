@@ -306,9 +306,15 @@ func (s *Session) start(cfg Config) {
 
 // Open starts a new stream and waits for the peer to acknowledge it.
 //
-// The wait is what surfaces a refusal: a peer at its stream limit answers with a
-// CLOSE_STREAM carrying a reason rather than silently ignoring the request.
-func (s *Session) Open(ctx context.Context) (*Stream, error) {
+// The payload travels with the OPEN_STREAM frame and is available to the
+// accepting side as [Stream.OpenPayload]. On the relay-to-agent path it carries
+// the signed grant, so the agent has everything it needs to decide before it
+// dials anything.
+//
+// The wait is what surfaces a refusal: a peer at its stream limit, or one that
+// refuses the grant, answers with a CLOSE_STREAM carrying a reason rather than
+// silently ignoring the request.
+func (s *Session) Open(ctx context.Context, payload []byte) (*Stream, error) {
 	s.mu.Lock()
 	if s.isClosed() {
 		s.mu.Unlock()
@@ -326,7 +332,7 @@ func (s *Session) Open(ctx context.Context) (*Stream, error) {
 	s.pending[id] = ackCh
 	s.mu.Unlock()
 
-	if err := s.conn.W.WriteFrame(proto.TypeOpenStream, id, nil); err != nil {
+	if err := s.conn.W.WriteFrame(proto.TypeOpenStream, id, payload); err != nil {
 		s.retire(id)
 		return nil, fmt.Errorf("send open_stream: %w", err)
 	}
@@ -478,7 +484,7 @@ func (s *Session) readLoop() {
 func (s *Session) dispatch(f proto.Frame) error {
 	switch f.Type {
 	case proto.TypeOpenStream:
-		return s.handleOpen(f.StreamID)
+		return s.handleOpen(f.StreamID, f.Payload)
 
 	case proto.TypeStreamOK:
 		s.completeOpen(f.StreamID, proto.ReasonOK)
@@ -547,7 +553,7 @@ func (s *Session) dispatch(f proto.Frame) error {
 }
 
 // handleOpen registers a stream the peer opened, or refuses it.
-func (s *Session) handleOpen(id uint32) error {
+func (s *Session) handleOpen(id uint32, payload []byte) error {
 	s.mu.Lock()
 	if _, exists := s.streams[id]; exists {
 		s.mu.Unlock()
@@ -567,6 +573,10 @@ func (s *Session) handleOpen(id uint32) error {
 		return s.conn.W.WriteClose(id, proto.ReasonLimitStreamsExceeded)
 	}
 	st := newStream(id, s, s.window)
+	// Copied out of the codec buffer, which is reused on the next read.
+	if len(payload) > 0 {
+		st.openPayload = append([]byte(nil), payload...)
+	}
 	s.streams[id] = st
 	s.mu.Unlock()
 

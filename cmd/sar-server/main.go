@@ -8,8 +8,12 @@
 // certificate, so an unenrolled peer is refused during the TLS handshake, before
 // it can send a single protocol frame.
 //
-// There is still no authorization: any enrolled operator may reach any enrolled
-// device. Policy and grants are the next step.
+// Access is decided here: policy is evaluated and a signed, expiring grant is
+// issued. The relay carries traffic under that grant, and the endpoint agent
+// verifies it independently before dialing anything.
+//
+// There is no queryable audit trail yet, and a grant cannot be revoked before it
+// expires.
 //
 // Usage:
 //
@@ -22,10 +26,15 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -35,7 +44,9 @@ import (
 
 	"github.com/rilegu/secure-access-relay/internal/ca"
 	"github.com/rilegu/secure-access-relay/internal/control/enrollment"
+	"github.com/rilegu/secure-access-relay/internal/control/grants"
 	"github.com/rilegu/secure-access-relay/internal/control/httpapi"
+	"github.com/rilegu/secure-access-relay/internal/control/policy"
 	"github.com/rilegu/secure-access-relay/internal/keystore"
 	"github.com/rilegu/secure-access-relay/internal/logging"
 	"github.com/rilegu/secure-access-relay/internal/relay"
@@ -53,6 +64,10 @@ const caTTL = 10 * 365 * 24 * time.Hour
 // serverCertTTL is the relay's own certificate lifetime. Short: it is re-issued
 // on every start and never written to disk.
 const serverCertTTL = 90 * 24 * time.Hour
+
+// grantKeyID names the signing key inside every grant, so keys can be rotated
+// without invalidating everything at once.
+const grantKeyID = "key_1"
 
 func main() {
 	if err := run(); err != nil {
@@ -102,6 +117,7 @@ type deployment struct {
 	authority *ca.CA
 	store     *storage.Store
 	enroll    *enrollment.Service
+	issuer    *grants.Issuer
 }
 
 // openDeployment loads the authority and store, creating them on first use.
@@ -158,11 +174,89 @@ func openDeployment(stateDir string) (*deployment, error) {
 		return nil, err
 	}
 
+	issuer, err := openIssuer(stateDir)
+	if err != nil {
+		return nil, err
+	}
+
 	return &deployment{
 		authority: authority,
 		store:     store,
-		enroll:    enrollment.New(store, authority),
+		enroll:    enrollment.New(store, authority, issuer.PublicKey()),
+		issuer:    issuer,
 	}, nil
+}
+
+// openIssuer loads the grant signing key, creating it on first use.
+//
+// The signing key is the most valuable secret in the deployment: anyone holding
+// it can mint authorization for any operator to reach any resource. It goes
+// through the keystore — sealed with DPAPI on Windows — and never into the
+// database. A database compromise must not be a key compromise.
+func openIssuer(stateDir string) (*grants.Issuer, error) {
+	keyPath := filepath.Join(stateDir, "grant-signing.key")
+
+	keyPEM, _, err := keystore.Load(keyPath)
+	switch {
+	case err == nil:
+		block, _ := pem.Decode(keyPEM)
+		if block == nil {
+			return nil, fmt.Errorf("grant signing key in %s is not valid PEM", keyPath)
+		}
+		parsed, perr := x509.ParsePKCS8PrivateKey(block.Bytes)
+		if perr != nil {
+			return nil, fmt.Errorf("parse grant signing key: %w", perr)
+		}
+		priv, ok := parsed.(ed25519.PrivateKey)
+		if !ok {
+			return nil, fmt.Errorf("grant signing key is %T, want ed25519", parsed)
+		}
+		return grants.NewIssuer(priv, grantKeyID)
+
+	case errors.Is(err, keystore.ErrNotFound):
+		_, priv, gerr := ed25519.GenerateKey(rand.Reader)
+		if gerr != nil {
+			return nil, fmt.Errorf("generate grant signing key: %w", gerr)
+		}
+		der, merr := x509.MarshalPKCS8PrivateKey(priv)
+		if merr != nil {
+			return nil, merr
+		}
+		encoded := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
+		if _, serr := keystore.Save(keyPath, encoded); serr != nil {
+			return nil, serr
+		}
+		return grants.NewIssuer(priv, grantKeyID)
+
+	default:
+		return nil, err
+	}
+}
+
+// loadRules reads the policy file.
+//
+// A missing policy file is not an error at startup, because a deployment that
+// has enrolled devices but written no policy yet is a legitimate state. It is
+// reported loudly, though: with no rules, every request is denied, and an
+// operator seeing nothing but denials should be told why.
+func loadRules(stateDir string, log *slog.Logger) []policy.Rule {
+	path := filepath.Join(stateDir, "policy.json")
+
+	rules, err := policy.LoadRules(path)
+	if err != nil {
+		if os.IsNotExist(errors.Unwrap(err)) || os.IsNotExist(err) {
+			log.Warn("no policy file; every request will be denied",
+				"path", path, "hint", "write policy.json to allow anything")
+			return nil
+		}
+		// A malformed policy file is fatal in effect: it produces no rules, which
+		// denies everything. Saying so is better than letting an operator wonder.
+		log.Error("policy file could not be read; every request will be denied",
+			"path", path, "error", err)
+		return nil
+	}
+	log.Info("policy loaded", "path", path, "rules", len(rules))
+	return rules
 }
 
 func cmdRun(args []string) error {
@@ -192,8 +286,10 @@ func cmdRun(args []string) error {
 	log.Info("authority ready",
 		"state_dir", *stateDir,
 		"fingerprint", enrollment.Fingerprint(dep.authority.Certificate()),
+		"grant_key_id", dep.issuer.KeyID(),
 	)
-	log.Warn("no authorization: any enrolled operator may reach any enrolled device")
+
+	rules := loadRules(*stateDir, log)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -201,8 +297,19 @@ func cmdRun(args []string) error {
 	// Control plane: server-authenticated TLS only. A peer that is enrolling has
 	// no certificate yet, so requiring one here would make enrollment impossible.
 	control, err := httpapi.New(httpapi.Config{
-		Addr:   *controlAddr,
-		TLS:    &tls.Config{Certificates: []tls.Certificate{serverCert}, MinVersion: transport.MinTLSVersion},
+		Addr: *controlAddr,
+		// Client certificates are verified if presented but not required.
+		// Enrollment cannot demand one — a peer enrolls precisely because it has
+		// none — so each route decides for itself, and the grants route requires
+		// one.
+		TLS: &tls.Config{
+			Certificates: []tls.Certificate{serverCert},
+			MinVersion:   transport.MinTLSVersion,
+			ClientAuth:   tls.VerifyClientCertIfGiven,
+			ClientCAs:    dep.authority.Pool(),
+		},
+		Issuer: dep.issuer,
+		Rules:  func() []policy.Rule { return rules },
 		Logger: log,
 	}, dep.enroll)
 	if err != nil {
@@ -215,6 +322,7 @@ func cmdRun(args []string) error {
 		Addr:       *addr,
 		TLS:        transport.ServerTLS(serverCert, dep.authority.Pool()),
 		Verify:     dep.enroll,
+		GrantKey:   dep.issuer.PublicKey(),
 		MaxStreams: uint32(*maxStreams),
 		Logger:     log,
 	})

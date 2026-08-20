@@ -15,6 +15,7 @@ package httpapi
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,6 +26,8 @@ import (
 	"time"
 
 	"github.com/rilegu/secure-access-relay/internal/control/enrollment"
+	"github.com/rilegu/secure-access-relay/internal/control/grants"
+	"github.com/rilegu/secure-access-relay/internal/control/policy"
 	"github.com/rilegu/secure-access-relay/internal/storage"
 )
 
@@ -38,6 +41,9 @@ const maxRequestBody = 16 << 10
 // Server is the control-plane HTTP server.
 type Server struct {
 	enroll *enrollment.Service
+	issuer *grants.Issuer
+	verify *enrollment.Service
+	rules  RulesFunc
 	log    *slog.Logger
 
 	srv   *http.Server
@@ -50,7 +56,15 @@ type Config struct {
 	Addr string
 	// TLS is required. Enrollment carries a token that grants an identity, and
 	// carrying it in the clear would hand it to anyone on the path.
-	TLS    *tls.Config
+	TLS *tls.Config
+
+	// Issuer signs grants. Optional: without it the grants route reports that it
+	// is not configured rather than silently accepting requests it cannot serve.
+	Issuer *grants.Issuer
+
+	// Rules supplies the policy rule set for each request.
+	Rules RulesFunc
+
 	Logger *slog.Logger
 }
 
@@ -63,10 +77,25 @@ func New(cfg Config, enroll *enrollment.Service) (*Server, error) {
 		cfg.Logger = slog.Default()
 	}
 
-	s := &Server{enroll: enroll, log: cfg.Logger, ready: make(chan struct{})}
+	rules := cfg.Rules
+	if rules == nil {
+		// No rule source means no rules, and no rules means every request is
+		// denied. That is the correct default for an authorization system.
+		rules = func() []policy.Rule { return nil }
+	}
+
+	s := &Server{
+		enroll: enroll,
+		issuer: cfg.Issuer,
+		verify: enroll,
+		rules:  rules,
+		log:    cfg.Logger,
+		ready:  make(chan struct{}),
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/enroll", s.handleEnroll)
+	mux.HandleFunc("POST /v1/grants", s.handleGrant)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, "ok\n")
@@ -134,6 +163,9 @@ type enrollResponse struct {
 	CA          string `json:"ca"`
 	Identity    string `json:"identity"`
 	NotAfter    string `json:"not_after"`
+	// GrantKey is the base64 public key that verifies grants. Without it an
+	// agent could authenticate but not authorize.
+	GrantKey string `json:"grant_key"`
 }
 
 // handleEnroll consumes a token and issues a certificate.
@@ -181,6 +213,7 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		CA:          string(result.CAPEM),
 		Identity:    result.Identity.String(),
 		NotAfter:    result.NotAfter.UTC().Format(time.RFC3339),
+		GrantKey:    base64.StdEncoding.EncodeToString(result.GrantPublicKey),
 	})
 }
 

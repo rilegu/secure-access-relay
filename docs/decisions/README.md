@@ -20,3 +20,4 @@ superseded by a later ADR that references them.
 | [0010](0010-certificate-is-the-identity.md) | The certificate is the identity, not the claim | accepted |
 | [0011](0011-sqlite-not-key-value.md) | SQLite for control-plane state, not a key-value store | accepted |
 | [0012](0012-win32-through-stdlib.md) | Reach Win32 through the standard library | accepted |
+| [0013](0013-canonical-grant-encoding.md) | Grants are signed over a hand-written canonical encoding | accepted |
