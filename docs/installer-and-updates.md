@@ -38,17 +38,22 @@ default inherited ACL grants Users read access, which would expose device state.
 | -------- | ----- |
 | Service name | `SecureAccessRelay` |
 | Display name | Secure Access Relay Agent |
-| Account | `LocalSystem` (v1; a virtual service account is a hardening follow-up) |
-| Start type | Automatic (Delayed Start) |
-| Recovery | restart after 5 s, 30 s, then every 60 s; reset count daily |
-| Dependencies | `Tcpip`, `Dnscache` |
+| Account | `LocalSystem` (a virtual service account is a hardening follow-up) |
+| Start type | Automatic (Delayed Start) — **implemented** |
+| Recovery | restart after 5 s, 30 s, then 60 s; counter reset daily — **implemented** |
+| Dependencies | `Tcpip`, `Dnscache` — not yet set |
+
+The service registers its command line at install time rather than reading configuration
+at start time, so `sc.exe qc` shows an administrator exactly how the service runs. The
+executable path is quoted unconditionally: an unquoted path containing a space is a
+long-standing privilege escalation, because the loader tries each prefix in turn.
 
 Delayed start avoids competing with boot-time networking, which otherwise produces a
 guaranteed first connection failure and a misleading error in the log on every boot.
 
 ## PowerShell installer
 
-Not written yet. `installer/install.ps1` and `installer/uninstall.ps1` will:
+**Implemented.** `installer/install.ps1` and `installer/uninstall.ps1`:
 
 1. Verify Administrator rights; fail clearly if absent.
 2. Stop and remove any existing service.
@@ -60,8 +65,11 @@ Not written yet. `installer/install.ps1` and `installer/uninstall.ps1` will:
    transcripts and audit logs.
 7. Start the service and wait for a healthy status.
 
-Uninstall reverses all of it, including WFP filter cleanup and Event Log source removal,
-and takes an explicit `-KeepState` flag for the reinstall case.
+Uninstall reverses all of it, including Event Log source removal, and **keeps state by
+default**. Removing an enrolled identity because someone uninstalled a service would turn
+a reinstall into a re-enrollment and an upgrade into an outage, so deleting the key and
+certificate requires an explicit `-RemoveState`. WFP filter cleanup joins this when there
+are filters to clean up.
 
 ## MSI packaging (WiX)
 

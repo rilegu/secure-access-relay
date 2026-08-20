@@ -59,6 +59,33 @@ The operator names a **resource**, never an address. The agent resolves that nam
 its own local allowlist and refuses anything that is not loopback. That is the difference
 between a resource proxy and a tunnel.
 
+### What is on the wire
+
+Two planes, two transports, chosen for different jobs:
+
+| | Transport | Client auth | Carries |
+| --- | --------- | ----------- | ------- |
+| **Data plane** | **TLS 1.3 over TCP — not HTTP** | mutual TLS | custom binary frames: multiplexed streams, flow control |
+| **Control plane** | **HTTPS** (HTTP over TLS 1.3) | server-authenticated only | JSON: enrollment |
+
+The data plane carries bulk traffic and needs multiplexing, credit-based flow control,
+and hard size limits — none of which HTTP provides. Nothing on it parses a request line
+or a header; it is TCP, then TLS, then a ten-byte frame header, then payload.
+
+The control plane is low-volume and human-facing, so it is ordinary HTTPS with JSON. You
+can `curl` it, and it is trivial to document.
+
+The one asymmetry: **enrollment cannot require a client certificate**, because a peer is
+connecting precisely because it does not have one yet. That is the bootstrap problem, and
+it is why the enrollment code carries the authority fingerprint — the peer verifies the
+server before sending its token. Every *other* connection in the system is mutual TLS,
+and a peer without a certificate from this deployment's authority is refused during the
+handshake.
+
+TLS 1.3 only, everywhere. Older versions bring renegotiation and cipher negotiation that
+exist for compatibility with software this project does not need to talk to, and both
+ends are built from this repository.
+
 ### Enrollment, once per peer
 
 ```
@@ -109,7 +136,7 @@ becomes reachable only through an authorized, time-bounded, recorded session.
 
 | Binary | Runs on | Role |
 | ------ | ------- | ---- |
-| `sar-agent` | the protected machine | Enrolls once, then holds an outbound mTLS session. Local resource allowlist, dials only loopback. Never listens. |
+| `sar-agent` | the protected machine | Runs as a Windows service. Enrolls once, then holds an outbound mTLS session. Local resource allowlist, dials only loopback. Never listens. |
 | `sar-server` | a reachable VM you control | Control plane (certificate authority, enrollment, revocation) **and** relay (joins authorized streams). |
 | `sarctl` | the operator's laptop | Enrolls once, then opens a local loopback listener and carries it through the relay. |
 | `sardiag` | the protected machine | Optional C diagnostics library, dynamically loaded. Not yet written. |
@@ -134,6 +161,16 @@ with no trust anchor can still verify the control plane before sending its token
 **Re-enrolling invalidates the old certificate.** The control plane records which
 certificate is current for an identity, so rotating after a suspected compromise is a
 remedy rather than a ritual.
+
+**The same binary is the service and the debugger.** Started by the Windows service
+manager it reports status and answers stop and shutdown; started from a console it runs
+directly. One code path, so console mode is a genuine way to debug the service rather
+than a second program with its own bugs.
+
+**Windows APIs are called through the standard library.** DPAPI, the service control
+manager, and the Event Log are reached with `syscall` rather than a third-party binding —
+about fifteen entry points, each visible with its structure layout and error handling.
+See [ADR-0012](docs/decisions/0012-win32-through-stdlib.md).
 
 **Loopback-only targets, enforced at startup.** A target must be a literal loopback
 address with an explicit port. Hostnames are rejected outright, so **no DNS lookup is ever
@@ -196,10 +233,12 @@ any enrolled operator may reach any enrolled device, because grants do not exist
 | Certificate-bound identity and roles | working |
 | Revocation and certificate supersession | working |
 | Device key sealed with DPAPI (Windows) | working |
+| Windows Service with restart-on-failure | working |
+| Windows Event Log for operational events | working |
+| PowerShell installer with ACL-protected state | working |
 | Named resources and signed time-bound grants | not implemented |
 | End-to-end encryption between operator and agent | not implemented |
 | Operator login and audit trail | not implemented |
-| Windows Service packaging and installer | not implemented |
 | WFP leak guard | not implemented |
 | Native diagnostics library | not implemented |
 
@@ -326,6 +365,30 @@ Revoke an identity and it is refused on its next connection:
 ```sh
 ./bin/sar-server revoke -device panel-lab-01
 ./bin/sar-server list
+```
+
+### As a Windows service
+
+On the protected machine, from an elevated prompt:
+
+```powershell
+.\installer\install.ps1 -EnrollmentCode sar1... -RelayAddr relay.example:443 -Target 127.0.0.1:8080
+```
+
+That copies the agent to Program Files, creates an ACL-protected state directory under
+ProgramData that Users cannot read, enrolls the device, and registers the service with
+delayed auto-start and restart-on-failure. Removal keeps the enrolled identity unless you
+ask for it to be deleted:
+
+```powershell
+.\installer\uninstall.ps1              # keeps the key and certificate
+.\installer\uninstall.ps1 -RemoveState  # forgets this device entirely
+```
+
+The agent can also manage its own registration:
+
+```powershell
+sar-agent service install|start|stop|status|uninstall
 ```
 
 ## Documentation

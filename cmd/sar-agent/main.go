@@ -29,6 +29,7 @@ import (
 	"github.com/rilegu/secure-access-relay/internal/identity"
 	"github.com/rilegu/secure-access-relay/internal/keystore"
 	"github.com/rilegu/secure-access-relay/internal/logging"
+	"github.com/rilegu/secure-access-relay/internal/winsvc"
 )
 
 // version is set at build time via -ldflags.
@@ -51,6 +52,8 @@ func run() error {
 		return cmdEnroll(os.Args[2:])
 	case "run":
 		return cmdRun(os.Args[2:])
+	case "service":
+		return cmdService(os.Args[2:])
 	case "-version", "--version", "version":
 		fmt.Println(version)
 		return nil
@@ -65,6 +68,11 @@ func usage() {
 
   enroll    obtain a certificate using an enrollment code
   run       connect to the relay and serve the configured resource
+  service   install, uninstall, start, stop, or query the Windows service
+
+The same binary runs as a Windows service and in the foreground. Started by the
+service manager it reports status and answers stop and shutdown; started from a
+console it runs directly, which is how it is debugged.
 
 Run a command with -h for its options.
 `)
@@ -124,7 +132,16 @@ func cmdRun(args []string) error {
 	)
 	_ = fs.Parse(args)
 
-	log := logging.New(*logLevel)
+	// Mirror warnings and errors to the platform's native log as well as to
+	// structured JSON. If the event source is unavailable — not Windows, not
+	// registered, not enough rights — this returns the plain logger and the
+	// reason, and the agent carries on: an endpoint must not go offline over a
+	// logging problem.
+	log, closeLog, evtErr := logging.NewWithEventLog(*logLevel, serviceName)
+	defer closeLog()
+	if evtErr != nil {
+		log.Debug("event log unavailable; logging to stderr only", "error", evtErr)
+	}
 
 	id, err := identity.Load(*stateDir)
 	if err != nil {
@@ -149,12 +166,30 @@ func cmdRun(args []string) error {
 		return err
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	// winsvc.Run connects to the service control manager when the process was
+	// started by it, and runs the function directly otherwise. The same code path
+	// therefore serves both, which is what keeps the console mode a genuine way
+	// to debug the service rather than a separate program with its own bugs.
+	return winsvc.Run(serviceName, func(ctx context.Context) error {
+		// Signal handling is derived from the service context, so a stop from the
+		// SCM and a Ctrl-C from a console both cancel the same thing.
+		ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+		defer stop()
 
-	if err := a.Run(ctx); err != nil && ctx.Err() == nil {
-		return err
-	}
-	log.Info("shutdown complete")
-	return nil
+		log.Info("agent starting",
+			"service", winsvc.IsService(),
+			"device_id", id.ID.ID,
+			"relay_addr", *relayAddr,
+		)
+
+		err := a.Run(ctx)
+		if err != nil && ctx.Err() == nil {
+			// Returned rather than swallowed: a non-nil error becomes a non-zero
+			// service exit code, which is what makes the SCM restart policy fire.
+			log.Error("agent stopped with an error", "error", err)
+			return err
+		}
+		log.Info("shutdown complete")
+		return nil
+	})
 }
