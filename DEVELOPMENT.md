@@ -1,8 +1,11 @@
 # Development guide
 
-Design rationale lives in [docs/](docs/) — start with
-[architecture.md](docs/architecture.md) and [threat-model.md](docs/threat-model.md).
-This file covers the rules that code has to follow.
+How this codebase is built and the rules its code follows. Design rationale lives in
+[docs/](docs/) — start with [architecture.md](docs/architecture.md) and
+[threat-model.md](docs/threat-model.md).
+
+**This project is not accepting outside contributions.** It is published so the design
+and the code can be read, not worked on collectively. Pull requests will not be merged.
 
 ## Non-negotiable invariants
 
@@ -63,13 +66,15 @@ were rejected and why.
 ```
 cmd/{sar-agent,sar-server,sarctl}/   entrypoints only, thin
 internal/
-  agent/         connect loop, resource registry, local dialer
+  agent/         endpoint runtime: connect loop, target validation, stream handling
+  operator/      operator-side forwarder: local listener, relay dial, pump
+  relay/         relay server; sessions/ streams/ authorization/
   control/       identity/ enrollment/ resources/ policy/ grants/ audit/
-  relay/         sessions/ streams/ authorization/
-  proto/         frames, codec, limits, version negotiation
-  transport/     mTLS setup, dial/listen, backoff, heartbeats
+  proto/         frames, codec, limits, reason codes
+  transport/     framed connection; TLS wrapping lands here
   storage/       interfaces + sqlite implementation
   config/ logging/
+  e2e/           all three components wired together in one process
   winsvc/ winpipe/ wincrypt/ wfp/ diagbridge/    all //go:build windows
 native/sardiag/  include/ src/ tests/   C diagnostics library
 deploy/          docker compose for control plane, relay, and database
@@ -119,6 +124,23 @@ converts a failure into broader access.**
 
 ## Code conventions
 
+**Comment the reasoning, not the syntax.** This is security-relevant networking code, and
+a reader has to be able to follow *why* a check exists, not just that it does. Every file
+should be understandable by someone who has read the docs but not the rest of the code.
+
+- Every package has a doc comment stating what it is responsible for and what it must
+  never do.
+- Every exported type and function has a doc comment.
+- Non-obvious decisions get an inline comment giving the reason: why a check happens
+  before an allocation, why a lock is held, why a buffer is reused, why an error is
+  deliberately not retried.
+- Anything that enforces a threat-model control or an invariant says so explicitly, and
+  names the threat or invariant it maps to.
+- Do not comment what the code plainly says. `i++ // increment i` is noise; the goal is
+  to save the reader from reconstructing an argument, not from reading Go.
+
+Other conventions:
+
 - Errors wrap with `%w`, and carry a reason code wherever a policy decision is involved.
 - Every network operation takes a `context.Context` with a deadline. No unbounded reads.
 - All buffers are bounded. Reject oversized frames rather than allocating for them.
@@ -128,8 +150,10 @@ converts a failure into broader access.**
 - Reason codes are a compatibility surface. New ones may be added; existing ones never
   change meaning.
 
-## Security reporting
+## On security
 
-This is experimental software and should not be deployed anywhere that matters. If you
-find a flaw in the design, open an issue describing the attack path — the
-[threat model](docs/threat-model.md) lists what is already known and in scope.
+This is experimental software and should not be deployed anywhere that matters. It has
+not been audited, and the [threat model](docs/threat-model.md) records both the controls
+it intends to provide and the ones it does not yet implement.
+
+Read that document before drawing any conclusion about what this software protects.

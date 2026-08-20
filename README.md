@@ -75,24 +75,66 @@ Full detail: [architecture.md](docs/architecture.md) ·
 
 ## Status
 
-**Not yet functional.** The design is specified and the implementation has not started.
-Nothing in this repository will grant access to anything today.
+**The data path works; none of the security does.** Traffic can be forwarded end to
+end, but there is no encryption, no authentication, and no authorization — anything
+that can reach the relay's operator port gets a stream.
 
 | Capability | State |
 | ---------- | ----- |
 | Protocol, threat model, and authorization design | specified |
-| TCP forwarding through the relay | not implemented |
-| Framed multiplexed protocol with flow control | not implemented |
+| Framed wire protocol with enforced limits | working |
+| TCP forwarding, operator to endpoint | working, one stream at a time |
+| Loopback-only target enforcement | working |
+| Reconnect after a dropped relay connection | working |
+| Stream multiplexing and flow control | not implemented |
 | mTLS and device enrollment | not implemented |
 | End-to-end encryption between operator and agent | not implemented |
 | Windows Service packaging and installer | not implemented |
 | Named resources and signed time-bound grants | not implemented |
-| Operator CLI and audit trail | not implemented |
+| Operator login and audit trail | not implemented |
 | WFP leak guard | not implemented |
 | Native diagnostics library | not implemented |
 
 Read [docs/threat-model.md](docs/threat-model.md) before drawing any security conclusion
-from the design documents — several properties described there are not yet backed by code.
+from the design documents — most of the controls described there are not yet backed by
+code.
+
+## Trying it
+
+Four processes on one machine. Nothing listens on a routable interface.
+
+```sh
+make build
+
+# A local service to expose. Binds strictly to loopback.
+go run ./testdata/fixtures/httpfixture.go -addr 127.0.0.1:8080
+
+# The relay: one port for endpoint agents, one for operators.
+./bin/sar-server -agent-addr 127.0.0.1:17070 -operator-addr 127.0.0.1:17071
+
+# The endpoint agent. Dials out; never listens.
+./bin/sar-agent -relay-addr 127.0.0.1:17070 -target 127.0.0.1:8080
+
+# The operator forward.
+./bin/sarctl -relay-addr 127.0.0.1:17071 -listen 127.0.0.1:18080 -resource fixture
+```
+
+Then:
+
+```sh
+curl http://127.0.0.1:18080/health
+```
+
+The request travels `curl -> sarctl -> relay -> agent -> 127.0.0.1:8080` and back. The
+fixture is never reachable from outside the machine, and the endpoint opens no inbound
+port.
+
+To see the enforcement, point the agent somewhere it must not go:
+
+```sh
+./bin/sar-agent -target 192.168.1.10:8080   # refuses to start: target must be loopback
+./bin/sarctl -listen 0.0.0.0:18080          # refuses to start: listen must be loopback
+```
 
 ## Non-goals
 
@@ -133,7 +175,7 @@ registration are described in
 [docs/installer-and-updates.md](docs/installer-and-updates.md).
 
 Invariants, layout, stack rationale, and code conventions are in
-[CONTRIBUTING.md](CONTRIBUTING.md).
+[DEVELOPMENT.md](DEVELOPMENT.md).
 
 ## License
 

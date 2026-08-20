@@ -127,7 +127,14 @@ auth_failed
 session_replaced
 idle_timeout
 shutdown
+no_agent
 ```
+
+`no_agent` reports that no endpoint agent is currently connected to serve the
+request. Like `limit_streams_exceeded` it is an **availability** condition, not an
+authorization one, and must never be reported as `policy_denied`: the operator may
+well be entitled to the resource, and telling them otherwise sends them to argue
+about permissions they already have.
 
 `target_connection_refused` must never be reported as a policy denial, and
 `policy_denied` must never be reported as a network error. Conflating them destroys the
@@ -172,6 +179,36 @@ Not JWT: the claim set is fixed, the algorithm is fixed, and there is no `alg` f
 confuse. Canonical encoding is defined in `internal/proto` and covered by round-trip and
 tamper tests. Verification requires all fields present; unknown fields are rejected
 rather than ignored.
+
+## Implementation status
+
+This document specifies the target protocol. The current build implements part of it, and
+the gaps are load-bearing enough to state rather than leave a reader to infer.
+
+| Element | Status |
+| ------- | ------ |
+| Frame header layout, encode/decode, limits | implemented |
+| `OPEN_STREAM`, `STREAM_OK`, `STREAM_DATA`, `CLOSE_STREAM`, `ERROR` | implemented |
+| Reason codes | implemented |
+| `HELLO` / `HELLO_ACK` version negotiation | **not implemented** |
+| `AUTH` / `AUTH_OK` | **not implemented** |
+| `STREAM_WINDOW` credit-based flow control | **not implemented** |
+| `PING` / `PONG` keepalive and idle timeout | **not implemented** |
+| Multiple concurrent streams | **not implemented** — one at a time |
+| TLS | **not implemented** |
+| Grants | **not implemented** |
+
+Two consequences of those gaps are visible in how the current build behaves:
+
+- **The relay separates agents from operators by listening on two ports** rather than by
+  a handshake, because peers have no way to say what they are yet. The `HELLO`/`AUTH`
+  exchange replaces this, and the second port goes away with it.
+- **The version byte is checked but never negotiated.** A peer sending an unrecognised
+  version is refused outright, which is the correct failure, but there is no range
+  exchange to agree on a common version.
+
+Unimplemented frame types are still defined and still rejected as unknown if they appear,
+so a peer that sends one gets a clear protocol error rather than silence.
 
 ## Compatibility rules
 

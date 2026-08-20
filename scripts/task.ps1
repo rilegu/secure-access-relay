@@ -12,7 +12,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('all', 'build', 'test', 'integration', 'win-integration', 'vet', 'fmt', 'lint', 'tidy', 'clean')]
+    [ValidateSet('all', 'build', 'test', 'test-race', 'integration', 'win-integration', 'vet', 'fmt', 'lint', 'tidy', 'clean')]
     [string]$Task = 'all'
 )
 
@@ -42,7 +42,14 @@ function Test-Gofmt {
 
 switch ($Task) {
     'build'           { Invoke-Step 'build'       { go build -o bin/ ./cmd/... } }
-    'test'            { Invoke-Step 'unit tests'  { go test -race -count=1 ./... } }
+    'test'            { Invoke-Step 'unit tests'  { go test -count=1 ./... } }
+    'test-race'       {
+        # The race detector requires cgo and a C toolchain. Shipped binaries stay
+        # CGO_ENABLED=0; only the test harness relaxes that.
+        $env:CGO_ENABLED = '1'
+        try   { Invoke-Step 'race tests' { go test -race -count=1 ./... } }
+        finally { $env:CGO_ENABLED = '0' }
+    }
     'integration'     { Invoke-Step 'integration' { go test -tags=integration -count=1 ./... } }
     'win-integration' {
         Write-Warning 'Windows integration tests install services and alter firewall state.'
@@ -60,7 +67,10 @@ switch ($Task) {
     'all' {
         Invoke-Step 'go vet' { go vet ./... }
         Test-Gofmt
-        Invoke-Step 'unit tests' { go test -race -count=1 ./... }
+        Invoke-Step 'unit tests' { go test -count=1 ./... }
+        $env:CGO_ENABLED = '1'
+        try   { Invoke-Step 'race tests' { go test -race -count=1 ./... } }
+        finally { $env:CGO_ENABLED = '0' }
         Invoke-Step 'build'      { go build -o bin/ ./cmd/... }
     }
 }

@@ -9,7 +9,8 @@ converts a failure into broader access.**
 | Layer | Build tag | Runs on | Verifies |
 | ----- | --------- | ------- | -------- |
 | Unit | none | any OS, every commit | frame codec, grant verification, policy evaluator, limits, backoff, redaction |
-| Component | `integration` | Linux + Windows CI | control plane, relay protocol, storage, fake agent |
+| Wiring | none | any OS, every commit | all components in one process: forwarding, refusal paths, transfer integrity |
+| Component | `integration` | Linux + Windows CI | control plane, storage, fake agent — **none written yet** |
 | Windows integration | `windows_integration` | disposable Windows VM only | SCM lifecycle, named pipes, DPAPI, cert store, WFP, installer |
 | System E2E | scripted | isolated VM + control/relay | enrollment through teardown, with audit assertions |
 | Chaos / demo | manual | dedicated lab VM | network loss, crash, reboot, upgrade, uninstall |
@@ -19,6 +20,12 @@ go test ./...                            # must stay fast and deterministic
 go test -tags=integration ./...
 go test -tags=windows_integration ./...  # NEVER on a developer host
 ```
+
+The wiring tests in `internal/e2e` deliberately carry **no build tag**. They are the only
+place the components are checked against each other rather than in isolation, they are
+deterministic, and they finish in about a second over loopback — so they belong in the
+run that happens on every commit rather than in a tier someone has to remember. The
+`integration` tag is reserved for heavier component tests that need external services.
 
 Windows integration tests install services, alter firewall state, and inject network
 failures. Use a snapshot-revertible VM.

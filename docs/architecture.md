@@ -44,6 +44,23 @@ The endpoint's approved service is reached only as `127.0.0.1:<port>`:
 sar-agent --dial--> 127.0.0.1:8080   (the one approved resource)
 ```
 
+## What is built today
+
+The diagram above is the target. The current build implements the data path and none of
+the security layers:
+
+| Component | Today |
+| --------- | ----- |
+| `sar-agent` | outbound connect, one configured loopback target, reconnect on failure. No service packaging, no identity, no grant verification. |
+| `sar-server` | relay only. Two listeners, session registry, frame forwarding, one stream at a time. No control plane. |
+| `sarctl` | local forwarder. No login, no grant request, no audit query. |
+| Transport | plain TCP. **No TLS.** |
+| Authorization | none. Anything reaching the operator port gets a stream. |
+
+The one control that is fully enforced is the loopback restriction on resource targets:
+the agent refuses to start if its target is anything else. Everything else in the trust
+boundary table below describes the design, not the running code.
+
 ## Trust boundaries
 
 | # | Boundary | Crossed by | Authenticated by |
