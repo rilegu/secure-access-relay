@@ -16,3 +16,4 @@ superseded by a later ADR that references them.
 | [0006](0006-cgo-disabled-pure-go-sqlite.md) | CGO_ENABLED=0 everywhere; pure-Go SQLite | accepted |
 | [0007](0007-one-binary-two-package-trees.md) | Control plane and relay ship as one binary, two package trees | accepted |
 | [0008](0008-no-existing-overlay-platform.md) | Build on TLS directly rather than adopt a zero-trust overlay | accepted |
+| [0009](0009-half-close-and-abort.md) | Streams half-close; broken connections abort | accepted |

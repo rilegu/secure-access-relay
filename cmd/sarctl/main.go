@@ -34,8 +34,10 @@ func main() {
 
 func run() error {
 	var (
-		relayAddr = flag.String("relay-addr", "127.0.0.1:17071", "relay address to connect out to")
+		relayAddr = flag.String("relay-addr", "127.0.0.1:17070", "relay address to connect out to")
 		listen    = flag.String("listen", "127.0.0.1:18080", "local address to accept connections on; must be loopback")
+		device    = flag.String("device", "", "identifier of the endpoint to reach (required)")
+		user      = flag.String("user", "", "operator identity to present")
 		resource  = flag.String("resource", "default", "name of the resource to reach on the endpoint")
 		logLevel  = flag.String("log-level", "info", "log level: debug, info, warn, error")
 
@@ -57,6 +59,8 @@ func run() error {
 	f, err := operator.New(operator.Config{
 		RelayAddr:  *relayAddr,
 		ListenAddr: *listen,
+		DeviceID:   *device,
+		UserID:     *user,
 		Resource:   *resource,
 		Logger:     log,
 	})

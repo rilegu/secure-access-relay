@@ -9,7 +9,7 @@ converts a failure into broader access.**
 | Layer | Build tag | Runs on | Verifies |
 | ----- | --------- | ------- | -------- |
 | Unit | none | any OS, every commit | frame codec, grant verification, policy evaluator, limits, backoff, redaction |
-| Wiring | none | any OS, every commit | all components in one process: forwarding, refusal paths, transfer integrity |
+| Wiring | none | any OS, every commit | all components in one process: forwarding, device routing across several endpoints, concurrency, refusal paths, transfer integrity, mid-stream teardown |
 | Component | `integration` | Linux + Windows CI | control plane, storage, fake agent — **none written yet** |
 | Windows integration | `windows_integration` | disposable Windows VM only | SCM lifecycle, named pipes, DPAPI, cert store, WFP, installer |
 | System E2E | scripted | isolated VM + control/relay | enrollment through teardown, with audit assertions |

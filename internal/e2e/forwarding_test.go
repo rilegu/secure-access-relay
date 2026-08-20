@@ -2,12 +2,20 @@ package e2e
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
+	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/rilegu/secure-access-relay/internal/agent"
+	"github.com/rilegu/secure-access-relay/internal/operator"
+	"github.com/rilegu/secure-access-relay/internal/relay"
 )
 
 // TestGoldenPath is the done-condition for this phase: an HTTP request travels
@@ -172,14 +180,15 @@ func TestTargetNotListening(t *testing.T) {
 	}
 }
 
-// TestConcurrentRequestsAreBounded checks that the one-stream-at-a-time cap holds
-// under concurrent load.
+// TestConcurrentRequestsAllSucceed checks that many requests are served at once.
 //
-// The cap is a real limit in this phase, so some requests are expected to fail.
-// What must not happen is a hang, a panic, or a request that succeeds with
-// corrupted data because two streams shared a connection.
-func TestConcurrentRequestsAreBounded(t *testing.T) {
-	h := newHarness(t, options{})
+// This is the property multiplexing exists to provide, and it is the assertion
+// that changed when it landed: previously the chain served one stream at a time
+// and refusals were expected. Now every request within the stream limit must
+// succeed, and each must get its own correct response — a crossed stream would
+// show up as a body from the wrong request rather than as an error.
+func TestConcurrentRequestsAllSucceed(t *testing.T) {
+	h := newHarness(t, options{maxStreams: 16})
 
 	const concurrency = 8
 
@@ -195,7 +204,8 @@ func TestConcurrentRequestsAreBounded(t *testing.T) {
 			defer wg.Done()
 			resp, err := h.client(20 * time.Second).Get(h.ForwardURL + "/health")
 			if err != nil {
-				return // refused by the stream cap; expected in this phase
+				t.Errorf("concurrent request failed: %v", err)
+				return
 			}
 			defer func() { _ = resp.Body.Close() }()
 
@@ -216,10 +226,10 @@ func TestConcurrentRequestsAreBounded(t *testing.T) {
 	}
 	wg.Wait()
 
-	if succeeded == 0 {
-		t.Fatal("no concurrent request succeeded; the chain is not serving under load")
+	if succeeded != concurrency {
+		t.Fatalf("%d/%d concurrent requests succeeded; multiplexing should serve all of them",
+			succeeded, concurrency)
 	}
-	t.Logf("%d/%d concurrent requests served; the rest were refused by the single-stream cap", succeeded, concurrency)
 }
 
 // TestAgentReconnectsAfterRelayRestart checks that an agent recovers when the
@@ -402,5 +412,133 @@ func TestSlowReaderBackpressure(t *testing.T) {
 	}
 	if !bytes.Equal(hasher.Sum(nil), want.Sum(nil)) {
 		t.Fatal("payload corrupted when the reader was slower than the writer")
+	}
+}
+
+// TestManyAgentsAndOperators checks that one relay serves several endpoints and
+// several operators at once, and that each operator reaches the endpoint it
+// asked for.
+//
+// Routing correctness is the point. Reaching the wrong device would be a
+// nuisance today and a security failure once grants name a specific endpoint, so
+// each fixture returns a distinct identity and every response is checked against
+// the device that was requested.
+func TestManyAgentsAndOperators(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	relaySrv := relay.New(relay.Config{Addr: "127.0.0.1:0", MaxStreams: 16, Logger: log})
+	go func() { _ = relaySrv.Run(ctx) }()
+	waitReady(t, relaySrv.Ready(), "relay")
+
+	// Three endpoints, each with its own fixture reporting its own name.
+	devices := []string{"dev_alpha", "dev_beta", "dev_gamma"}
+	for _, id := range devices {
+		name := id
+		fx := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, name)
+		}))
+		t.Cleanup(fx.Close)
+
+		a, err := agent.New(agent.Config{
+			RelayAddr:     relaySrv.Addr(),
+			DeviceID:      name,
+			Target:        fx.Listener.Addr().String(),
+			RetryInterval: 20 * time.Millisecond,
+			Logger:        log,
+		})
+		if err != nil {
+			t.Fatalf("create agent %s: %v", name, err)
+		}
+		go func() { _ = a.Run(ctx) }()
+	}
+	waitForAgent(t, relaySrv, len(devices))
+
+	// One operator forward per device, all against the same relay.
+	forwards := make(map[string]string, len(devices))
+	for _, id := range devices {
+		f, err := operator.New(operator.Config{
+			RelayAddr:  relaySrv.Addr(),
+			ListenAddr: "127.0.0.1:0",
+			DeviceID:   id,
+			UserID:     "usr_" + id,
+			Resource:   "fixture",
+			Logger:     log,
+		})
+		if err != nil {
+			t.Fatalf("create forwarder for %s: %v", id, err)
+		}
+		go func() { _ = f.Run(ctx) }()
+		waitReady(t, f.Ready(), "forwarder "+id)
+		forwards[id] = "http://" + f.Addr()
+	}
+
+	// Drive all of them at once, so a routing mistake shows up as a response
+	// from the wrong endpoint rather than being hidden by sequential timing.
+	var wg sync.WaitGroup
+	for id, url := range forwards {
+		for i := 0; i < 4; i++ {
+			wg.Add(1)
+			go func(id, url string) {
+				defer wg.Done()
+				client := &http.Client{Timeout: 20 * time.Second,
+					Transport: &http.Transport{DisableKeepAlives: true}}
+				resp, err := client.Get(url + "/whoami")
+				if err != nil {
+					t.Errorf("%s: %v", id, err)
+					return
+				}
+				defer func() { _ = resp.Body.Close() }()
+				body, err := io.ReadAll(resp.Body)
+				if err != nil {
+					t.Errorf("%s: read: %v", id, err)
+					return
+				}
+				if string(body) != id {
+					t.Errorf("forward for %s reached %q: the relay routed to the wrong endpoint",
+						id, body)
+				}
+			}(id, url)
+		}
+	}
+	wg.Wait()
+
+	if n := relaySrv.AgentCount(); n != len(devices) {
+		t.Fatalf("relay has %d agents, want %d", n, len(devices))
+	}
+}
+
+// TestUnknownDeviceRefused checks that asking for an endpoint nobody is serving
+// fails promptly rather than hanging.
+func TestUnknownDeviceRefused(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	relaySrv := relay.New(relay.Config{Addr: "127.0.0.1:0", Logger: log})
+	go func() { _ = relaySrv.Run(ctx) }()
+	waitReady(t, relaySrv.Ready(), "relay")
+
+	f, err := operator.New(operator.Config{
+		RelayAddr:  relaySrv.Addr(),
+		ListenAddr: "127.0.0.1:0",
+		DeviceID:   "dev_does_not_exist",
+		Logger:     log,
+	})
+	if err != nil {
+		t.Fatalf("create forwarder: %v", err)
+	}
+	go func() { _ = f.Run(ctx) }()
+	waitReady(t, f.Ready(), "forwarder")
+
+	client := &http.Client{Timeout: 10 * time.Second,
+		Transport: &http.Transport{DisableKeepAlives: true}}
+	resp, err := client.Get("http://" + f.Addr() + "/health")
+	if err == nil {
+		_ = resp.Body.Close()
+		t.Fatal("request succeeded for a device with no connected agent")
 	}
 }

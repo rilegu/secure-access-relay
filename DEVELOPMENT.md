@@ -66,12 +66,14 @@ were rejected and why.
 ```
 cmd/{sar-agent,sar-server,sarctl}/   entrypoints only, thin
 internal/
-  agent/         endpoint runtime: connect loop, target validation, stream handling
-  operator/      operator-side forwarder: local listener, relay dial, pump
-  relay/         relay server; sessions/ streams/ authorization/
-  control/       identity/ enrollment/ resources/ policy/ grants/ audit/
-  proto/         frames, codec, limits, reason codes
+  proto/         frames, codec, handshake encoding, limits, reason codes
+  mux/           many streams over one connection: flow control, keepalive
+  bridge/        bidirectional copy with half-close and abort semantics
   transport/     framed connection; TLS wrapping lands here
+  agent/         endpoint runtime: session, target validation, stream handling
+  operator/      operator-side forwarder: local listener, one session, many streams
+  relay/         relay server; sessions/ (registry) authorization/
+  control/       identity/ enrollment/ resources/ policy/ grants/ audit/
   storage/       interfaces + sqlite implementation
   config/ logging/
   e2e/           all three components wired together in one process

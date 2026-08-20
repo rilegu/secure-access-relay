@@ -56,7 +56,7 @@ Assumed **out of scope** (stated so the boundary is honest, not because they are
 | T9 | Device key extracted from disk | Key is DPAPI-protected under the service account; state directory ACL'd to LocalSystem + Administrators. Copying the directory to another host yields an undecryptable key. |
 | T10 | Revoked device continues an established session | Revocation terminates live sessions, not merely new ones. Agent enforces heartbeat timeout; loss of control-plane contact denies *new* streams. |
 | T11 | Unprivileged local user drives the service via named pipe | Pipe ACL restricted to Administrators and the interactive owner; every request is authorized, not merely accepted. |
-| T12 | Resource exhaustion via stream or frame flooding | Per-connection max frame size, per-agent concurrent stream cap, per-session byte and time budgets, bounded buffers, read deadlines. |
+| T12 | Resource exhaustion via stream or frame flooding | Per-connection max frame size, concurrent stream cap negotiated at the handshake, credit-based flow control, bounded buffers, read deadlines. A peer exceeding its window is disconnected rather than buffered for. **Implemented.** |
 | T13 | Malformed protocol input causes crash or overread | Length-prefixed frames validated against limits before allocation; fuzz tests over the codec. |
 | T14 | Secrets leak through logs or the support bundle | Central redaction layer; tokens, keys, signatures, and payload bytes never reach a log sink; support bundle is generated through the same redactor. |
 | T15 | Failure of the control plane widens access | Deny-by-default on any authorization error, timeout, or signature-verification failure. There is no permissive fallback path. |
@@ -64,14 +64,37 @@ Assumed **out of scope** (stated so the boundary is honest, not because they are
 | T17 | Native DLL is replaced with a hostile one | DLL loaded by absolute path from the ACL-protected install directory, Authenticode signature verified before load, never from `%PATH%` or the working directory. |
 | T18 | Audit gaps hide an incident | Security-relevant decisions emit an audit event before the action completes; denials are audited with the same weight as allows. |
 
-## Known v1 limitations
+## Not implemented in the current build
 
-Stated plainly. A security tool that hides its limitations is worse than one that names them.
+The controls in the table above describe the intended design. Several are not yet backed
+by code, and the gap is large enough that it must be read before the table is.
+
+- **There is no transport encryption at all.** Not weak encryption, none: the data plane
+  is plain TCP. Every threat above that assumes an attacker "cannot break TLS 1.3" is
+  therefore unmitigated today. T3 has no mitigation whatsoever.
+- **Identities are unverified claims.** A peer states a device or user identifier in its
+  handshake and nothing checks it. Any peer that can reach the relay may assert any
+  device ID and be routed to as that endpoint. T2, T6, and T8 depend entirely on
+  enrollment and mutual TLS, and none of that exists. The identifiers are for routing and
+  log correlation only.
+- **There is no authorization.** No policy engine, no grants, no verification before a
+  stream is opened. T5, T7's grant component, T10, and T15 are unimplemented.
+- **There is no audit trail.** Sessions and streams are logged, but there is no queryable
+  append-only record. T18 is unimplemented.
+
+Two controls *are* enforced today and can be relied on: resource targets are loopback-only
+(the agent refuses to start otherwise), and flow control is mandatory rather than
+advisory (a peer exceeding its granted window has its session terminated).
+
+## Known limitations of the design
+
+These remain true even once the code above lands. A security tool that hides its
+limitations is worse than one that names them.
 
 - **End-to-end encryption between operator and agent is planned, not implemented.**
-  Until the operator<->agent session key exchange lands, the relay terminates TLS and
-  can see plaintext. T3 is therefore only partially mitigated today. The README and
-  this document must not claim otherwise before the code is there.
+  Once mutual TLS lands, the relay will terminate TLS and see plaintext. Closing that
+  needs a second encryption layer inside the relay-terminated one. Until it exists, the
+  relay is trusted for confidentiality — never for authorization.
 - **Clock skew** is a real weakness for short-TTL grants. v1 bounds tolerated skew and
   denies outside it; it does not implement a trusted time source.
 - **Audit log is append-only by convention, not cryptographically tamper-evident.**

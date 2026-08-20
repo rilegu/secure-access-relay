@@ -36,10 +36,10 @@ func main() {
 
 func run() error {
 	var (
-		agentAddr    = flag.String("agent-addr", "127.0.0.1:17070", "address to accept endpoint agent connections on")
-		operatorAddr = flag.String("operator-addr", "127.0.0.1:17071", "address to accept operator connections on")
-		logLevel     = flag.String("log-level", "info", "log level: debug, info, warn, error")
-		showVersion  = flag.Bool("version", false, "print version and exit")
+		addr        = flag.String("addr", "127.0.0.1:17070", "address to accept agent and operator connections on")
+		maxStreams  = flag.Uint("max-streams", 16, "maximum concurrent streams per session")
+		logLevel    = flag.String("log-level", "info", "log level: debug, info, warn, error")
+		showVersion = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Parse()
 
@@ -57,10 +57,12 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// One listener for both roles. A peer states whether it is an agent or an
+	// operator in its handshake, so port separation is no longer needed.
 	srv := relay.New(relay.Config{
-		AgentAddr:    *agentAddr,
-		OperatorAddr: *operatorAddr,
-		Logger:       log,
+		Addr:       *addr,
+		MaxStreams: uint32(*maxStreams),
+		Logger:     log,
 	})
 
 	err := srv.Run(ctx)

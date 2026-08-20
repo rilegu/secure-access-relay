@@ -51,15 +51,22 @@ the security layers:
 
 | Component | Today |
 | --------- | ----- |
-| `sar-agent` | outbound connect, one configured loopback target, reconnect on failure. No service packaging, no identity, no grant verification. |
-| `sar-server` | relay only. Two listeners, session registry, frame forwarding, one stream at a time. No control plane. |
-| `sarctl` | local forwarder. No login, no grant request, no audit query. |
+| `sar-agent` | outbound session, concurrent streams, one configured loopback target, reconnect on failure. No service packaging, no verified identity, no grant verification. |
+| `sar-server` | relay only. One listener for both roles, session registry keyed by device, stream joining. No control plane. |
+| `sarctl` | local forwarder. One relay session carrying many streams. No login, no grant request, no audit query. |
 | Transport | plain TCP. **No TLS.** |
-| Authorization | none. Anything reaching the operator port gets a stream. |
+| Identity | device and user identities are **claims that nothing verifies**. |
+| Authorization | none. Any peer reaching the relay may name any device. |
 
-The one control that is fully enforced is the loopback restriction on resource targets:
-the agent refuses to start if its target is anything else. Everything else in the trust
-boundary table below describes the design, not the running code.
+Two controls are fully enforced today:
+
+- **Resource targets are loopback-only.** The agent refuses to start if its target is
+  anything else.
+- **Flow control is enforced, not advisory.** A peer that sends beyond the window it was
+  granted has its session terminated rather than being allowed to grow a buffer.
+
+Everything else in the trust boundary table below describes the design, not the running
+code.
 
 ## Trust boundaries
 

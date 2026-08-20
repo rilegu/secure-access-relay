@@ -71,8 +71,34 @@ relay                                       agent
   |---------- CLOSE_STREAM(reason) ---------->|
 ```
 
-`stream_id` is allocated by the relay and is unique per connection. IDs are never
-reused within a connection.
+### Stream identifiers
+
+IDs are unique per connection and never reused. Each end owns half the identifier
+space: **the peer that dialled numbers its streams odd, the peer that accepted numbers
+them even.** Both ends can therefore open streams at the same time without ever choosing
+the same identifier, and a peer using the wrong parity is a protocol error — it would be
+reaching into identifiers its counterpart is about to allocate.
+
+### Closing a stream: half-close versus abort
+
+`CLOSE_STREAM` is a **half-close**, modelled on TCP's FIN. It means "I will send nothing
+further on this stream". The peer's reads then return end-of-stream, and the peer may
+keep sending in the other direction. A stream is finished when both directions have
+closed.
+
+This matters for request/response traffic: a client that finishes its request and
+half-closes must still be able to read the response. Collapsing both directions into one
+close would discard the response to every completed request.
+
+A `CLOSE_STREAM` carrying a **non-`ok` reason is an abort**. Both directions end
+immediately and anything still buffered is discarded, because the reason says the data is
+no longer meaningful.
+
+The distinction is load-bearing in the other direction too. When a forwarded connection
+breaks rather than ending cleanly, the stream must be aborted rather than half-closed: a
+half-close would leave the peer writing into a flow-control window that will never
+reopen, blocking forever and holding its own upstream connection open with it. That
+presents as a hang rather than an error, which is far harder to diagnose.
 
 ### Flow control
 
@@ -123,12 +149,19 @@ target_connection_refused
 target_timeout
 protocol_version_unsupported
 protocol_malformed_frame
+flow_control_violation
 auth_failed
 session_replaced
 idle_timeout
 shutdown
 no_agent
 ```
+
+`flow_control_violation` reports that a peer sent more data than the window it
+was granted. It is distinct from `protocol_malformed_frame` on purpose: the frame
+was well formed, the peer simply ignored a limit it had been told. It is fatal to
+the connection, because the only alternative to disconnecting is buffering
+without bound.
 
 `no_agent` reports that no endpoint agent is currently connected to serve the
 request. Like `limit_streams_exceeded` it is an **availability** condition, not an
@@ -188,27 +221,23 @@ the gaps are load-bearing enough to state rather than leave a reader to infer.
 | Element | Status |
 | ------- | ------ |
 | Frame header layout, encode/decode, limits | implemented |
+| `HELLO` / `HELLO_ACK` version negotiation | implemented |
+| `AUTH` / `AUTH_OK` | implemented — **identities are unverified claims** |
 | `OPEN_STREAM`, `STREAM_OK`, `STREAM_DATA`, `CLOSE_STREAM`, `ERROR` | implemented |
+| `STREAM_WINDOW` credit-based flow control | implemented |
+| `PING` / `PONG` keepalive and idle timeout | implemented |
+| Multiple concurrent streams | implemented |
 | Reason codes | implemented |
-| `HELLO` / `HELLO_ACK` version negotiation | **not implemented** |
-| `AUTH` / `AUTH_OK` | **not implemented** |
-| `STREAM_WINDOW` credit-based flow control | **not implemented** |
-| `PING` / `PONG` keepalive and idle timeout | **not implemented** |
-| Multiple concurrent streams | **not implemented** — one at a time |
 | TLS | **not implemented** |
-| Grants | **not implemented** |
+| Grants and policy | **not implemented** |
 
-Two consequences of those gaps are visible in how the current build behaves:
+The gap that matters most: **AUTH carries claims that nothing verifies.** Any peer may
+assert any device or user identity. The identities exist so sessions can be routed and
+correlated in logs; they confer no authority, and no component may treat them as though
+they do. Mutual TLS and enrollment are what make them mean anything.
 
-- **The relay separates agents from operators by listening on two ports** rather than by
-  a handshake, because peers have no way to say what they are yet. The `HELLO`/`AUTH`
-  exchange replaces this, and the second port goes away with it.
-- **The version byte is checked but never negotiated.** A peer sending an unrecognised
-  version is refused outright, which is the correct failure, but there is no range
-  exchange to agree on a common version.
-
-Unimplemented frame types are still defined and still rejected as unknown if they appear,
-so a peer that sends one gets a clear protocol error rather than silence.
+Because a peer now states its role in `HELLO`, the relay serves both agents and operators
+on **one listener**. The separate ports used before this existed are gone.
 
 ## Compatibility rules
 
