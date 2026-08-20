@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/rilegu/secure-access-relay/internal/bridge"
+	"github.com/rilegu/secure-access-relay/internal/identity"
 	"github.com/rilegu/secure-access-relay/internal/mux"
 	"github.com/rilegu/secure-access-relay/internal/proto"
 	"github.com/rilegu/secure-access-relay/internal/transport"
@@ -21,11 +22,10 @@ type Config struct {
 	// (threat T1).
 	RelayAddr string
 
-	// DeviceID identifies this endpoint to the relay.
-	//
-	// A claim, not a credential. Nothing verifies it until enrollment and mutual
-	// TLS exist, and the agent must not present it as though it proves anything.
-	DeviceID string
+	// Identity is this endpoint's enrolled credentials. Required: without a
+	// certificate the agent has no way to prove which device it is, and the relay
+	// will not admit it.
+	Identity *identity.Identity
 
 	// Target is the local service this agent is willing to reach.
 	//
@@ -80,8 +80,8 @@ func New(cfg Config) (*Agent, error) {
 	if cfg.KeepAlive == 0 {
 		cfg.KeepAlive = cfg.IdleTimeout / 3
 	}
-	if cfg.DeviceID == "" {
-		return nil, errors.New("agent: device id is required")
+	if cfg.Identity == nil {
+		return nil, errors.New("agent: not enrolled; run enroll first")
 	}
 	if err := ValidateTarget(cfg.Target); err != nil {
 		return nil, err
@@ -147,8 +147,17 @@ func (a *Agent) Run(ctx context.Context) error {
 
 // session runs one relay session from dial to disconnect.
 func (a *Agent) session(ctx context.Context) error {
+	// Mutual TLS, verifying the relay against the authority this agent enrolled
+	// with. A relay that cannot present a certificate from that authority is not
+	// the relay this agent belongs to, however reachable it may be.
+	tlsCfg := transport.ClientTLS(
+		a.cfg.Identity.Certificate,
+		a.cfg.Identity.CAPool,
+		a.serverName(),
+	)
+
 	dialCtx, cancel := context.WithTimeout(ctx, proto.DialTimeout)
-	conn, err := transport.Dial(dialCtx, a.cfg.RelayAddr)
+	conn, err := transport.DialTLS(dialCtx, a.cfg.RelayAddr, tlsCfg)
 	cancel()
 	if err != nil {
 		return fmt.Errorf("connect to relay: %w", err)
@@ -160,7 +169,7 @@ func (a *Agent) session(ctx context.Context) error {
 		KeepAlive:   a.cfg.KeepAlive,
 		IdleTimeout: a.cfg.IdleTimeout,
 		Logger:      a.log,
-	}, proto.Auth{DeviceID: a.cfg.DeviceID})
+	}, proto.Auth{DeviceID: a.cfg.Identity.ID.ID})
 	if err != nil {
 		_ = conn.Close()
 		return fmt.Errorf("relay handshake: %w", err)
@@ -170,9 +179,10 @@ func (a *Agent) session(ctx context.Context) error {
 	a.log.Info("connected to relay",
 		"relay_addr", a.cfg.RelayAddr,
 		"session_id", sess.ID,
-		"device_id", a.cfg.DeviceID,
+		"device_id", a.cfg.Identity.ID.ID,
 		"target", a.cfg.Target,
-		"secure", false, // no TLS or authentication in this build; stated, not implied
+		"mutual_tls", true,
+		"key_protection", string(a.cfg.Identity.Protection),
 	)
 
 	for {
@@ -234,4 +244,20 @@ func (a *Agent) handleStream(ctx context.Context, st *mux.Stream) {
 		"bytes_from_target", stats.BToA,
 		"duration_ms", time.Since(start).Milliseconds(),
 	)
+}
+
+// serverName is the name the relay's certificate must match.
+//
+// It falls back to the host part of the relay address when enrollment did not
+// record one, so that a certificate issued for an IP still verifies. It never
+// falls back to skipping verification.
+func (a *Agent) serverName() string {
+	if a.cfg.Identity.ServerName != "" {
+		return a.cfg.Identity.ServerName
+	}
+	host, _, err := net.SplitHostPort(a.cfg.RelayAddr)
+	if err != nil {
+		return a.cfg.RelayAddr
+	}
+	return host
 }

@@ -3,6 +3,8 @@ package agent
 import (
 	"errors"
 	"testing"
+
+	"github.com/rilegu/secure-access-relay/internal/identity"
 )
 
 // TestValidateTarget guards invariant 4: a resource may only ever point at
@@ -78,19 +80,23 @@ func TestValidateTarget(t *testing.T) {
 // never produce a running agent that only refuses at stream time, because that
 // turns a configuration error into something discovered during an incident.
 func TestNewRejectsBadTarget(t *testing.T) {
-	_, err := New(Config{RelayAddr: "127.0.0.1:1", DeviceID: "dev_test", Target: "192.168.1.10:8080"})
+	_, err := New(Config{
+		RelayAddr: "127.0.0.1:1",
+		Identity:  &identity.Identity{},
+		Target:    "192.168.1.10:8080",
+	})
 	if !errors.Is(err, ErrTargetNotLoopback) {
 		t.Fatalf("New with a LAN target returned %v, want ErrTargetNotLoopback", err)
 	}
 }
 
-// TestNewRequiresDeviceID checks that an agent cannot start anonymously.
+// TestNewRequiresIdentity checks that an agent cannot start without credentials.
 //
-// An endpoint that does not name itself cannot be routed to, and a relay would
-// have nothing to put in an audit record. The identity proves nothing yet, but
-// its absence is still a configuration error rather than a default.
-func TestNewRequiresDeviceID(t *testing.T) {
+// An unenrolled agent has no way to prove which device it is and would be refused
+// by the relay during the TLS handshake anyway. Failing at construction turns a
+// confusing connection error into a clear instruction to enroll.
+func TestNewRequiresIdentity(t *testing.T) {
 	if _, err := New(Config{RelayAddr: "127.0.0.1:1", Target: "127.0.0.1:8080"}); err == nil {
-		t.Fatal("New succeeded without a device id")
+		t.Fatal("New succeeded without an identity")
 	}
 }

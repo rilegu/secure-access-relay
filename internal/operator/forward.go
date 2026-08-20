@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/rilegu/secure-access-relay/internal/bridge"
+	"github.com/rilegu/secure-access-relay/internal/identity"
 	"github.com/rilegu/secure-access-relay/internal/mux"
 	"github.com/rilegu/secure-access-relay/internal/proto"
 	"github.com/rilegu/secure-access-relay/internal/transport"
@@ -27,15 +28,17 @@ type Config struct {
 	// onto the operator's network.
 	ListenAddr string
 
-	// DeviceID names the endpoint to reach.
-	UserID string
+	// Identity is this operator's enrolled credentials. Required: the relay
+	// establishes who is connecting from the certificate, not from a flag.
+	Identity *identity.Identity
 
-	// Resource names what to reach on that endpoint. Carried to the agent, which
+	// Resource names what to reach on the endpoint. Carried to the agent, which
 	// resolves it against its own allowlist. Not an address, and never becomes one
 	// on this side.
 	Resource string
 
-	// DeviceID identifies the endpoint the operator wants.
+	// DeviceID identifies the endpoint the operator wants to reach. This is a
+	// request, not an identity claim: who is asking comes from the certificate.
 	DeviceID string
 
 	KeepAlive   time.Duration
@@ -81,6 +84,9 @@ func New(cfg Config) (*Forwarder, error) {
 	}
 	if cfg.KeepAlive == 0 {
 		cfg.KeepAlive = cfg.IdleTimeout / 3
+	}
+	if cfg.Identity == nil {
+		return nil, errors.New("operator: not enrolled; run enroll first")
 	}
 	if cfg.DeviceID == "" {
 		return nil, errors.New("operator: device id is required")
@@ -129,9 +135,10 @@ func (f *Forwarder) Run(ctx context.Context) error {
 	f.log.Info("forwarding",
 		"listen_addr", addr,
 		"relay_addr", f.cfg.RelayAddr,
+		"user_id", f.cfg.Identity.ID.ID,
 		"device_id", f.cfg.DeviceID,
 		"resource", f.cfg.Resource,
-		"secure", false, // no TLS or authentication in this build
+		"mutual_tls", true,
 	)
 
 	// Closing the listener is the only way to interrupt a blocked Accept.
@@ -189,8 +196,14 @@ func (f *Forwarder) session(ctx context.Context) (*mux.Session, error) {
 		}
 	}
 
+	tlsCfg := transport.ClientTLS(
+		f.cfg.Identity.Certificate,
+		f.cfg.Identity.CAPool,
+		f.serverName(),
+	)
+
 	dialCtx, cancel := context.WithTimeout(ctx, proto.DialTimeout)
-	conn, err := transport.Dial(dialCtx, f.cfg.RelayAddr)
+	conn, err := transport.DialTLS(dialCtx, f.cfg.RelayAddr, tlsCfg)
 	cancel()
 	if err != nil {
 		return nil, fmt.Errorf("connect to relay: %w", err)
@@ -203,7 +216,7 @@ func (f *Forwarder) session(ctx context.Context) (*mux.Session, error) {
 		Logger:      f.log,
 	}, proto.Auth{
 		DeviceID: f.cfg.DeviceID,
-		UserID:   f.cfg.UserID,
+		UserID:   f.cfg.Identity.ID.ID,
 		Resource: f.cfg.Resource,
 	})
 	if err != nil {
@@ -265,4 +278,17 @@ func (f *Forwarder) handle(ctx context.Context, local net.Conn) {
 		"bytes_received", stats.BToA,
 		"duration_ms", time.Since(start).Milliseconds(),
 	)
+}
+
+// serverName is the name the relay's certificate must match. It never falls back
+// to skipping verification.
+func (f *Forwarder) serverName() string {
+	if f.cfg.Identity.ServerName != "" {
+		return f.cfg.Identity.ServerName
+	}
+	host, _, err := net.SplitHostPort(f.cfg.RelayAddr)
+	if err != nil {
+		return f.cfg.RelayAddr
+	}
+	return host
 }

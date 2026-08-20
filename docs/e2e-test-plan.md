@@ -77,12 +77,15 @@ Step 12 is the minimum end-to-end proof: bytes traverse the whole chain.
 Each row must fail **closed**, produce the exact reason code, emit an audit event, and
 deliver **zero bytes** to the target.
 
-| # | Scenario | Expected reason code |
-| - | -------- | -------------------- |
-| D1 | Unenrolled agent connects | `auth_failed` |
-| D2 | Enrollment token reused for a second device | `auth_failed` |
-| D3 | Altered device certificate | `auth_failed` |
-| D4 | Revoked device opens a new session | `auth_failed` |
+| # | Scenario | Expected reason code | Status |
+| - | -------- | -------------------- | ------ |
+| D1 | Unenrolled agent connects | refused at TLS handshake | **implemented** |
+| D2 | Enrollment token reused for a second device | enrollment refused | **implemented** |
+| D3 | Altered device certificate | refused at TLS handshake | **implemented** |
+| D4 | Revoked device opens a new session | refused after certificate check | **implemented** |
+| D4b | Superseded certificate after re-enrollment | refused after certificate check | **implemented** |
+| D4c | Peer claims an identity that is not its certificate's | `auth_failed` | **implemented** |
+| D4d | Device certificate used to open an operator session | `auth_failed` | **implemented** |
 | D5 | Grant with one byte flipped | `grant_invalid_signature` |
 | D6 | Grant past `expires_at` | `grant_expired` |
 | D7 | Grant with future `issued_at` beyond skew | `grant_not_yet_valid` |
@@ -101,6 +104,17 @@ deliver **zero bytes** to the target.
 
 D11 deserves emphasis: it is a **startup** failure, not a runtime denial. A misconfigured
 allowlist must never produce a running agent.
+
+D1 through D4 are worth noting for *where* they fail. An unenrolled or revoked peer is
+refused during the TLS handshake or immediately after it, before any protocol frame is
+read — so those denials never reach the framing layer at all. The reason codes in this
+table apply to denials the protocol can express; a peer refused at the transport gets a
+connection failure and nothing more, which is deliberate: an unauthenticated caller
+should not be told why.
+
+The mutual half is tested too: an agent or operator must refuse a relay whose certificate
+does not chain to the authority it enrolled with. Mutual means mutual, and a peer that
+accepted any server would hand its streams to whoever could redirect its traffic.
 
 ## Distinguishability tests
 

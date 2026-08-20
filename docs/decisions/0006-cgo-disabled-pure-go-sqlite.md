@@ -21,6 +21,28 @@ It is the better-tested driver, but requiring cgo would contradict
 cross-compilation, and fast reproducible builds — for a component whose v1 workload is
 a few hundred rows.
 
+## Implementation status
+
+The `CGO_ENABLED=0` half of this decision is enforced today, everywhere.
+
+The storage half is **not yet implemented**. `internal/storage` is currently a
+mutex-guarded JSON file written atomically, with no database and no interfaces. It holds
+tens of records — enrolled identities and enrollment tokens — and needs exactly one
+transactional operation, single-use token consumption, which one mutex provides.
+
+That is adequate for the current data and inadequate for what comes next:
+
+- Every mutation rewrites the whole file. Fine for tens of records; unworkable for
+  thousands.
+- There are no queries, no indexes, and no partial reads.
+- **The audit trail cannot be a rewritten file at all.** It is append-only and grows
+  without bound, which is the opposite of what this store does.
+
+So the decision recorded here stands and is simply not due yet. It becomes due with the
+policy engine and the audit trail, where the query patterns justify a database. Adopting
+it will end this project's zero-dependency property, which is a real cost and is the
+reason it has not been paid early.
+
 ## Consequences
 
 - All binaries are statically linked and copy-deployable, which matters most for the

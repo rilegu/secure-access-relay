@@ -35,7 +35,7 @@ endpoint.
        +----------------------------------------------------------+
                                    |
                                    v
-                            storage (SQLite v1)
+                        storage (JSON today, SQLite next)
 ```
 
 The endpoint's approved service is reached only as `127.0.0.1:<port>`:
@@ -51,22 +51,29 @@ the security layers:
 
 | Component | Today |
 | --------- | ----- |
-| `sar-agent` | outbound session, concurrent streams, one configured loopback target, reconnect on failure. No service packaging, no verified identity, no grant verification. |
-| `sar-server` | relay only. One listener for both roles, session registry keyed by device, stream joining. No control plane. |
-| `sarctl` | local forwarder. One relay session carrying many streams. No login, no grant request, no audit query. |
-| Transport | plain TCP. **No TLS.** |
-| Identity | device and user identities are **claims that nothing verifies**. |
-| Authorization | none. Any peer reaching the relay may name any device. |
+| `sar-agent` | enrolls, holds an outbound mTLS session, serves concurrent streams to one configured loopback target, reconnects on failure. No service packaging, no grant verification. |
+| `sar-server` | control plane (authority, enrollment, revocation) **and** relay (one listener for both roles, registry keyed by device, stream joining). No policy engine. |
+| `sarctl` | enrolls, opens one relay session carrying many streams. No login flow, no grant request, no audit query. |
+| Transport | **TLS 1.3, mutual, on every data-plane connection.** |
+| Identity | **from the certificate.** Enrolled, revocable, role-bound. |
+| Authorization | **none.** Any enrolled operator may reach any enrolled device. |
 
-Two controls are fully enforced today:
+Enforced today:
 
-- **Resource targets are loopback-only.** The agent refuses to start if its target is
-  anything else.
-- **Flow control is enforced, not advisory.** A peer that sends beyond the window it was
-  granted has its session terminated rather than being allowed to grow a buffer.
+- **Mutual TLS.** A peer without a certificate from this authority is refused during the
+  handshake, before it can send a protocol frame.
+- **Identity is certificate-bound.** A handshake claim that disagrees with the
+  certificate ends the connection, and the role is part of the certificate.
+- **Revocation and supersession** are checked on every connection; re-enrolling
+  invalidates the previous certificate.
+- **Resource targets are loopback-only.** The agent refuses to start otherwise.
+- **Flow control is enforced, not advisory.** A peer exceeding its granted window has its
+  session terminated rather than being allowed to grow a buffer.
+- **Device keys are sealed with DPAPI on Windows.**
 
-Everything else in the trust boundary table below describes the design, not the running
-code.
+The largest remaining gap is authorization: nothing decides *whether* a given operator
+may reach a given resource. Until that exists, the trust boundary table below describes
+the design rather than the running code.
 
 ## Trust boundaries
 

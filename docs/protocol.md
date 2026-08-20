@@ -222,7 +222,7 @@ the gaps are load-bearing enough to state rather than leave a reader to infer.
 | ------- | ------ |
 | Frame header layout, encode/decode, limits | implemented |
 | `HELLO` / `HELLO_ACK` version negotiation | implemented |
-| `AUTH` / `AUTH_OK` | implemented — **identities are unverified claims** |
+| `AUTH` / `AUTH_OK` | implemented — identity is verified against the peer certificate |
 | `OPEN_STREAM`, `STREAM_OK`, `STREAM_DATA`, `CLOSE_STREAM`, `ERROR` | implemented |
 | `STREAM_WINDOW` credit-based flow control | implemented |
 | `PING` / `PONG` keepalive and idle timeout | implemented |
@@ -231,10 +231,17 @@ the gaps are load-bearing enough to state rather than leave a reader to infer.
 | TLS | **not implemented** |
 | Grants and policy | **not implemented** |
 
-The gap that matters most: **AUTH carries claims that nothing verifies.** Any peer may
-assert any device or user identity. The identities exist so sessions can be routed and
-correlated in logs; they confer no authority, and no component may treat them as though
-they do. Mutual TLS and enrollment are what make them mean anything.
+**AUTH does not establish identity; the certificate does.** Every data-plane connection
+is mutual TLS, and the relay reads a peer's identity from a URI in its certificate before
+reading a single frame. What a peer states in AUTH is checked against that certificate,
+and a disagreement ends the connection — see
+[ADR-0010](decisions/0010-certificate-is-the-identity.md).
+
+AUTH still carries one thing that is *not* an identity claim: the device an operator
+wants to reach. That is a request, and it is answered by the relay rather than believed.
+
+The gap that matters most now is **authorization**. Identity says who a peer is; nothing
+yet says what it may do, so any enrolled operator may reach any enrolled device.
 
 Because a peer now states its role in `HELLO`, the relay serves both agents and operators
 on **one listener**. The separate ports used before this existed are gone.

@@ -46,15 +46,15 @@ Assumed **out of scope** (stated so the boundary is honest, not because they are
 | # | Threat | Control |
 | - | ------ | ------- |
 | T1 | Attacker reaches the endpoint directly from the internet | Agent never listens on a network interface. Outbound connections only. No inbound rule is created by the installer. |
-| T2 | Compromised relay opens a stream on its own authority | Agent independently verifies the Ed25519 grant signature, expiry, and `device_id` before dialing. Relay possesses no signing key. |
+| T2 | Compromised relay opens a stream on its own authority | Agent independently verifies the Ed25519 grant signature, expiry, and `device_id` before dialing. Relay possesses no signing key. **Grant verification not yet implemented**; the relay is currently trusted to decide that a stream may open. |
 | T3 | Compromised relay reads payload | Data plane is TLS between operator and agent; relay forwards ciphertext. (v1 caveat below.) |
 | T4 | Grant replayed after expiry | `expires_at` checked at the agent against local clock; max TTL 30 minutes; skew tolerance bounded and explicit. |
 | T5 | Grant tampered with (extended TTL, swapped resource) | Whole grant is signed; any field change invalidates the signature. |
-| T6 | Grant for device A replayed at device B | `device_id` is inside the signed grant and compared with the agent's own identity. |
+| T6 | Grant for device A replayed at device B | `device_id` is inside the signed grant and compared with the agent's own identity. Device identity itself is now certificate-bound: a peer cannot present one identity and claim another. |
 | T7 | Operator requests a LAN or internet target | Target address is never operator-supplied. The operator names a `resource_id`; the agent resolves it in its own local allowlist, and rejects any non-loopback target. |
-| T8 | Enrollment token reused to enroll a second device | Tokens are single-use, short-lived, and marked consumed transactionally on first use. |
-| T9 | Device key extracted from disk | Key is DPAPI-protected under the service account; state directory ACL'd to LocalSystem + Administrators. Copying the directory to another host yields an undecryptable key. |
-| T10 | Revoked device continues an established session | Revocation terminates live sessions, not merely new ones. Agent enforces heartbeat timeout; loss of control-plane contact denies *new* streams. |
+| T8 | Enrollment token reused to enroll a second device | Tokens are single-use, short-lived, and marked consumed transactionally on first use. Only a hash is stored, so a leaked store yields no usable tokens. **Implemented.** |
+| T9 | Device key extracted from disk | Key is DPAPI-protected under the service account; copying the directory to another host or reading it as another account yields an undecryptable key. **Implemented on Windows**; other platforms fall back to file permissions and say so at startup. |
+| T10 | Revoked device continues an established session | Revocation is checked on every new connection, and a superseded certificate is refused. **Terminating a session already running is not implemented**: a revoked peer keeps its current session until it ends, and restarting the relay is the way to drop it. This is the weakest of the identity controls. |
 | T11 | Unprivileged local user drives the service via named pipe | Pipe ACL restricted to Administrators and the interactive owner; every request is authorized, not merely accepted. |
 | T12 | Resource exhaustion via stream or frame flooding | Per-connection max frame size, concurrent stream cap negotiated at the handshake, credit-based flow control, bounded buffers, read deadlines. A peer exceeding its window is disconnected rather than buffered for. **Implemented.** |
 | T13 | Malformed protocol input causes crash or overread | Length-prefixed frames validated against limits before allocation; fuzz tests over the codec. |
@@ -66,35 +66,56 @@ Assumed **out of scope** (stated so the boundary is honest, not because they are
 
 ## Not implemented in the current build
 
-The controls in the table above describe the intended design. Several are not yet backed
-by code, and the gap is large enough that it must be read before the table is.
+The controls in the table above describe the intended design. Some are now backed by
+code and some are not, and the difference must be read before the table is.
 
-- **There is no transport encryption at all.** Not weak encryption, none: the data plane
-  is plain TCP. Every threat above that assumes an attacker "cannot break TLS 1.3" is
-  therefore unmitigated today. T3 has no mitigation whatsoever.
-- **Identities are unverified claims.** A peer states a device or user identifier in its
-  handshake and nothing checks it. Any peer that can reach the relay may assert any
-  device ID and be routed to as that endpoint. T2, T6, and T8 depend entirely on
-  enrollment and mutual TLS, and none of that exists. The identifiers are for routing and
-  log correlation only.
-- **There is no authorization.** No policy engine, no grants, no verification before a
-  stream is opened. T5, T7's grant component, T10, and T15 are unimplemented.
-- **There is no audit trail.** Sessions and streams are logged, but there is no queryable
-  append-only record. T18 is unimplemented.
+**Enforced today:**
 
-Two controls *are* enforced today and can be relied on: resource targets are loopback-only
-(the agent refuses to start otherwise), and flow control is mandatory rather than
-advisory (a peer exceeding its granted window has its session terminated).
+- **Mutual TLS on every data-plane connection.** A peer without a certificate from this
+  deployment's authority is refused during the TLS handshake, before it can send a
+  protocol frame.
+- **Identity comes from the certificate**, never from what a peer says about itself. A
+  handshake claim that disagrees with the certificate ends the connection, and the role
+  is part of the certificate so a device credential cannot open an operator session.
+- **Single-use enrollment tokens**, consumed atomically, stored only as hashes.
+- **Revocation and supersession are checked on every connection.** Re-enrolling an
+  identity invalidates its previous certificate.
+- **Device keys are sealed with DPAPI on Windows**, so a copy of the state directory
+  taken to another machine or read by another account is undecryptable.
+- **Resource targets are loopback-only**; the agent refuses to start otherwise.
+- **Flow control is mandatory**, not advisory: a peer exceeding its granted window has
+  its session terminated rather than being buffered for.
+
+**Not yet implemented:**
+
+- **There is no authorization.** Any enrolled operator may reach any enrolled device.
+  There is no policy engine, no grant, and nothing verified before a stream is opened.
+  T5, the grant component of T7, and T15 are unimplemented, and this is the largest
+  remaining gap.
+- **There is no audit trail.** Sessions and streams are logged, but there is no
+  queryable append-only record. T18 is unimplemented.
+- **Revocation does not terminate live sessions.** It is checked when a connection is
+  established, so a session already running continues until it ends. T10 is therefore
+  only partially mitigated: restarting the relay is currently the way to drop them.
+- **On platforms without DPAPI the key is protected by file permissions only.** Reported
+  at startup rather than left to be assumed.
+- **Certificates are not renewed automatically.** They expire after thirty days and
+  re-enrollment is manual.
 
 ## Known limitations of the design
 
 These remain true even once the code above lands. A security tool that hides its
 limitations is worse than one that names them.
 
-- **End-to-end encryption between operator and agent is planned, not implemented.**
-  Once mutual TLS lands, the relay will terminate TLS and see plaintext. Closing that
-  needs a second encryption layer inside the relay-terminated one. Until it exists, the
-  relay is trusted for confidentiality — never for authorization.
+- **The relay terminates TLS and can see plaintext.** Mutual TLS authenticates both
+  ends to the relay; it does not hide traffic from it. Closing that needs a second
+  encryption layer inside the relay-terminated one, which is not built. The relay is
+  therefore trusted for confidentiality today — never for authorization, which is what
+  the agent-side verification protects.
+- **Whoever hands over an enrollment code is trusted.** The code is single-use and
+  short-lived and carries the authority fingerprint so the peer can verify the server,
+  but the channel that delivers it is outside the system. That is unavoidable at the
+  bottom of a trust chain.
 - **Clock skew** is a real weakness for short-TTL grants. v1 bounds tolerated skew and
   denies outside it; it does not implement a trusted time source.
 - **Audit log is append-only by convention, not cryptographically tamper-evident.**

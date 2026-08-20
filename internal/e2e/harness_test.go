@@ -1,35 +1,185 @@
-// Package e2e wires the three components together in one process and exercises
-// the whole forwarding path.
+// Package e2e wires the components together in one process and exercises the
+// whole path, including enrollment and mutual TLS.
 //
 // These tests are deliberately not behind a build tag. They are the only place
 // the components are checked against each other rather than in isolation, they
 // run in a second or two over loopback, and they are deterministic — so they
-// belong in the default test run where a regression is caught immediately rather
-// than in a slower tier someone remembers to run.
+// belong in the run that happens on every commit rather than in a slower tier
+// someone has to remember.
 package e2e
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/rilegu/secure-access-relay/internal/agent"
+	"github.com/rilegu/secure-access-relay/internal/ca"
+	"github.com/rilegu/secure-access-relay/internal/control/enrollment"
+	"github.com/rilegu/secure-access-relay/internal/identity"
 	"github.com/rilegu/secure-access-relay/internal/operator"
 	"github.com/rilegu/secure-access-relay/internal/relay"
+	"github.com/rilegu/secure-access-relay/internal/storage"
+	"github.com/rilegu/secure-access-relay/internal/transport"
 )
 
-// harness is a complete chain: fixture, relay, agent, and operator forwarder.
+// testDeviceID is the endpoint identity used throughout these tests.
+const testDeviceID = "dev_test_endpoint"
+
+// discardLogger keeps component output out of test results. A failing test is
+// diagnosed by its assertions; the log volume from four chatty components would
+// bury them.
+func discardLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// deployment is a control plane: an authority, a store, and an enrollment
+// service, plus the relay's server certificate.
+type deployment struct {
+	t          *testing.T
+	authority  *ca.CA
+	store      *storage.Store
+	enroll     *enrollment.Service
+	serverCert tls.Certificate
+}
+
+func newDeployment(t *testing.T) *deployment {
+	t.Helper()
+
+	authority, err := ca.Create("test authority", time.Hour)
+	if err != nil {
+		t.Fatalf("create authority: %v", err)
+	}
+	store, err := storage.Open(filepath.Join(t.TempDir(), "control.json"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	serverCert, err := authority.IssueServerCertificate([]string{"localhost", "127.0.0.1", "::1"}, time.Hour)
+	if err != nil {
+		t.Fatalf("issue server certificate: %v", err)
+	}
+
+	return &deployment{
+		t:          t,
+		authority:  authority,
+		store:      store,
+		enroll:     enrollment.New(store, authority),
+		serverCert: serverCert,
+	}
+}
+
+// enrollIdentity issues credentials the way a real peer obtains them.
 //
-//	client -> forwarder -> relay -> agent -> fixture
+// It goes through the enrollment service rather than signing directly, because
+// the relay verifies that an identity is *recorded* as enrolled, not merely that
+// its certificate is signed. Shortcutting that would exercise a path production
+// never takes.
+func (d *deployment) enrollIdentity(role ca.Role, id string) *identity.Identity {
+	d.t.Helper()
+
+	token, err := d.enroll.IssueToken(role, id)
+	if err != nil {
+		d.t.Fatalf("issue token for %s/%s: %v", role, id, err)
+	}
+
+	priv, csrPEM := newCSR(d.t)
+
+	result, err := d.enroll.Enroll(token, csrPEM)
+	if err != nil {
+		d.t.Fatalf("enroll %s/%s: %v", role, id, err)
+	}
+	return d.identityFrom(result.CertificatePEM, priv)
+}
+
+// identityFrom assembles a usable identity from a certificate and its key.
+func (d *deployment) identityFrom(certPEM []byte, priv ed25519.PrivateKey) *identity.Identity {
+	d.t.Helper()
+
+	keyDER, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		d.t.Fatal(err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		d.t.Fatalf("build key pair: %v", err)
+	}
+	block, _ := pem.Decode(certPEM)
+	leaf, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		d.t.Fatal(err)
+	}
+	cert.Leaf = leaf
+
+	certID, err := ca.IdentityOf(leaf)
+	if err != nil {
+		d.t.Fatalf("identity of issued certificate: %v", err)
+	}
+
+	return &identity.Identity{
+		Certificate: cert,
+		CAPool:      d.authority.Pool(),
+		ID:          certID,
+		ServerName:  "localhost",
+		NotAfter:    leaf.NotAfter,
+	}
+}
+
+// startRelay runs a relay against this deployment.
+func (d *deployment) startRelay(ctx context.Context, maxStreams uint32) *relay.Server {
+	d.t.Helper()
+
+	srv, err := relay.New(relay.Config{
+		Addr:       "127.0.0.1:0",
+		TLS:        transport.ServerTLS(d.serverCert, d.authority.Pool()),
+		Verify:     d.enroll,
+		MaxStreams: maxStreams,
+		Logger:     discardLogger(),
+	})
+	if err != nil {
+		d.t.Fatalf("create relay: %v", err)
+	}
+	go func() { _ = srv.Run(ctx) }()
+	waitReady(d.t, srv.Ready(), "relay")
+	return srv
+}
+
+// newCSR generates a key and a certificate request for it.
+func newCSR(t *testing.T) (ed25519.PrivateKey, []byte) {
+	t.Helper()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{
+		Subject:            pkix.Name{CommonName: "req"},
+		SignatureAlgorithm: x509.PureEd25519,
+	}, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return priv, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der})
+}
+
+// harness is a complete chain: deployment, fixture, relay, agent, and forwarder.
 type harness struct {
 	t *testing.T
 
+	Dep       *deployment
 	Fixture   *httptest.Server
 	Relay     *relay.Server
 	Forwarder *operator.Forwarder
@@ -38,10 +188,6 @@ type harness struct {
 	// traverse the entire chain.
 	ForwardURL string
 }
-
-// testDeviceID is the endpoint identity used throughout these tests. Nothing
-// verifies it; it exists so the relay can route an operator to the right agent.
-const testDeviceID = "dev_test_endpoint"
 
 // options adjusts how a harness is built, for tests that need a broken chain.
 type options struct {
@@ -63,11 +209,8 @@ func newHarness(t *testing.T, opt options) *harness {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
-	// Discard component logs by default. A failing test gets its diagnosis from
-	// assertions; the log volume from three chatty components would bury it.
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-
-	h := &harness{t: t}
+	log := discardLogger()
+	h := &harness{t: t, Dep: newDeployment(t)}
 
 	// The approved local service. httptest binds 127.0.0.1, which is the point:
 	// it is only reachable from this machine.
@@ -84,19 +227,12 @@ func newHarness(t *testing.T, opt options) *harness {
 		maxStreams = opt.maxStreams
 	}
 
-	// One listener for both roles now; peers state their role in the handshake.
-	h.Relay = relay.New(relay.Config{
-		Addr:       "127.0.0.1:0",
-		MaxStreams: maxStreams,
-		Logger:     log,
-	})
-	go func() { _ = h.Relay.Run(ctx) }()
-	waitReady(t, h.Relay.Ready(), "relay")
+	h.Relay = h.Dep.startRelay(ctx, maxStreams)
 
 	if !opt.skipAgent {
 		a, err := agent.New(agent.Config{
 			RelayAddr:     h.Relay.Addr(),
-			DeviceID:      testDeviceID,
+			Identity:      h.Dep.enrollIdentity(ca.RoleDevice, testDeviceID),
 			Target:        target,
 			MaxStreams:    maxStreams,
 			RetryInterval: 20 * time.Millisecond, // fast reconnect keeps tests brief
@@ -111,9 +247,9 @@ func newHarness(t *testing.T, opt options) *harness {
 
 	f, err := operator.New(operator.Config{
 		RelayAddr:  h.Relay.Addr(),
+		Identity:   h.Dep.enrollIdentity(ca.RoleOperator, "usr_test"),
 		ListenAddr: "127.0.0.1:0",
 		DeviceID:   testDeviceID,
-		UserID:     "usr_test",
 		Resource:   "fixture",
 		Logger:     log,
 	})
@@ -166,9 +302,9 @@ func waitForAgent(t *testing.T, r *relay.Server, want int) {
 
 // freePort returns a port with nothing listening on it.
 //
-// Used to point the agent at a target that will refuse a connection. The
-// listener is opened and immediately closed so the port is known to be valid and
-// almost certainly still free.
+// Used to point the agent at a target that will refuse a connection. The listener
+// is opened and immediately closed so the port is known to be valid and almost
+// certainly still free.
 func freePort(t *testing.T) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -226,3 +362,14 @@ func deterministicBytes(n int) []byte {
 	}
 	return b
 }
+
+// identityLike is a minimal credential pair for tests that need to present
+// credentials the agent and operator packages would refuse to construct.
+type identityLike struct {
+	cert tls.Certificate
+	pool *x509.CertPool
+}
+
+// emptyCert is a credential with no certificate, for testing that the relay
+// requires one.
+func emptyCert() tls.Certificate { return tls.Certificate{} }

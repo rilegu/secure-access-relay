@@ -48,16 +48,25 @@ were rejected and why.
 - **The library is loaded dynamically** via `golang.org/x/sys/windows` LazyDLL, **not
   cgo**. This keeps the agent pure Go, keeps the library optional at runtime, and keeps
   cross-compilation clean.
-- **Storage:** `modernc.org/sqlite` (pure Go) for v1, behind interfaces in
-  `internal/storage` so Postgres can replace it later. Not `mattn/go-sqlite3` — it
-  requires cgo.
+- **Storage today:** a mutex-guarded JSON file written atomically, in `internal/storage`.
+  It holds tens of records and needs single-use token consumption to be atomic, which one
+  mutex provides with no dependency. It rewrites the whole file on every mutation, so it
+  does not scale and cannot hold an audit trail.
+- **Storage next:** `modernc.org/sqlite` — pure Go, never `mattn/go-sqlite3`, which needs
+  cgo and would cost static binaries and ARM cross-compilation. It arrives with the policy
+  engine and audit trail. See [ADR-0011](docs/decisions/0011-sqlite-not-key-value.md) for
+  why a relational database rather than an embedded key-value store, and what that costs.
+  When it lands: parameterised statements without exception, and an unrecognised schema
+  version is a startup failure rather than a best-effort read.
 - **Two planes, two protocols:**
   - Control API: plain JSON over HTTPS. Curl-able and easy to document.
   - Data plane: hand-rolled binary framing in `internal/proto`. Not gRPC, not yamux —
     explicit limits and backpressure are the point, and they must stay auditable.
 - **Logging:** stdlib `log/slog` with a JSON handler, plus a Windows Event Log sink in
   `internal/logging`.
-- **CLI:** `spf13/cobra`.
+- **CLI:** the standard library's `flag`, with hand-written subcommand dispatch. Three
+  binaries with a handful of subcommands do not justify a framework; this is the rule
+  below applied to a case where it was tempting not to.
 - Keep the dependency list short and defensible. Every dependency should survive the
   question "why not the standard library?"
 
@@ -69,14 +78,17 @@ internal/
   proto/         frames, codec, handshake encoding, limits, reason codes
   mux/           many streams over one connection: flow control, keepalive
   bridge/        bidirectional copy with half-close and abort semantics
-  transport/     framed connection; TLS wrapping lands here
+  transport/     framed connection, TLS configuration, handshake completion
+  ca/            development certificate authority: issues and parses identities
+  keystore/      private key at rest; DPAPI on Windows, file permissions elsewhere
+  identity/      a peer's own key, certificate, and trust anchor; enrollment client
   agent/         endpoint runtime: session, target validation, stream handling
   operator/      operator-side forwarder: local listener, one session, many streams
   relay/         relay server; sessions/ (registry) authorization/
-  control/       identity/ enrollment/ resources/ policy/ grants/ audit/
-  storage/       interfaces + sqlite implementation
+  control/       enrollment/ httpapi/ ... resources/ policy/ grants/ audit/
+  storage/       enrolled identities and enrollment tokens
   config/ logging/
-  e2e/           all three components wired together in one process
+  e2e/           every component wired together in one process
   winsvc/ winpipe/ wincrypt/ wfp/ diagbridge/    all //go:build windows
 native/sardiag/  include/ src/ tests/   C diagnostics library
 deploy/          docker compose for control plane, relay, and database
