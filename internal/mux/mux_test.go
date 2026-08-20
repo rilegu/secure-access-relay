@@ -106,7 +106,7 @@ func TestStreamRoundTrip(t *testing.T) {
 		_, _ = io.Copy(st, st) // echo
 	}()
 
-	st, err := client.Open(ctx)
+	st, err := client.Open(ctx, nil)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -150,7 +150,7 @@ func TestHalfCloseAllowsResponse(t *testing.T) {
 		_ = st.Close()
 	}()
 
-	st, err := client.Open(ctx)
+	st, err := client.Open(ctx, nil)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -197,7 +197,7 @@ func TestConcurrentStreamsStayIsolated(t *testing.T) {
 		wg.Add(1)
 		go func(n int) {
 			defer wg.Done()
-			st, err := client.Open(ctx)
+			st, err := client.Open(ctx, nil)
 			if err != nil {
 				errs <- err
 				return
@@ -246,7 +246,7 @@ func TestFlowControlBoundsBuffering(t *testing.T) {
 		}
 	}()
 
-	st, err := client.Open(ctx)
+	st, err := client.Open(ctx, nil)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -328,7 +328,7 @@ func TestLargeTransferIntegrity(t *testing.T) {
 		}
 	}()
 
-	st, err := client.Open(ctx)
+	st, err := client.Open(ctx, nil)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -376,12 +376,12 @@ func TestStreamLimitRefusesExtraStreams(t *testing.T) {
 	}()
 
 	for i := 0; i < 2; i++ {
-		if _, err := client.Open(ctx); err != nil {
+		if _, err := client.Open(ctx, nil); err != nil {
 			t.Fatalf("open %d: %v", i, err)
 		}
 	}
 
-	_, err := client.Open(ctx)
+	_, err := client.Open(ctx, nil)
 	if err == nil {
 		t.Fatal("opened a third stream with a limit of two")
 	}
@@ -403,7 +403,7 @@ func TestResetPropagatesReason(t *testing.T) {
 		_ = st.Reset(proto.ReasonTargetConnectionRefused)
 	}()
 
-	st, err := client.Open(ctx)
+	st, err := client.Open(ctx, nil)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -430,7 +430,7 @@ func TestSessionCloseUnblocksStreams(t *testing.T) {
 		}
 	}()
 
-	st, err := client.Open(ctx)
+	st, err := client.Open(ctx, nil)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}

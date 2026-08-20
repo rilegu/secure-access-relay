@@ -75,7 +75,10 @@ Step 12 is the minimum end-to-end proof: bytes traverse the whole chain.
 ## Mandatory deny tests
 
 Each row must fail **closed**, produce the exact reason code, emit an audit event, and
-deliver **zero bytes** to the target.
+deliver **zero bytes** to the target. That last part is what the authorization tests
+actually assert on: the endpoint fixture counts every request reaching it, so a denial
+that still opened a connection would fail rather than passing as a denial in the logs
+only.
 
 | # | Scenario | Expected reason code | Status |
 | - | -------- | -------------------- | ------ |
@@ -86,21 +89,21 @@ deliver **zero bytes** to the target.
 | D4b | Superseded certificate after re-enrollment | refused after certificate check | **implemented** |
 | D4c | Peer claims an identity that is not its certificate's | `auth_failed` | **implemented** |
 | D4d | Device certificate used to open an operator session | `auth_failed` | **implemented** |
-| D5 | Grant with one byte flipped | `grant_invalid_signature` |
-| D6 | Grant past `expires_at` | `grant_expired` |
-| D7 | Grant with future `issued_at` beyond skew | `grant_not_yet_valid` |
-| D8 | Grant for device A presented at device B | `grant_device_mismatch` |
-| D9 | Revoked grant | `grant_revoked` |
-| D10 | Resource ID absent from the local allowlist | `resource_unknown` |
-| D11 | Resource configured with a non-loopback target | agent refuses to start |
-| D12 | User with no matching policy requests a grant | `policy_denied` |
-| D13 | Correct user, wrong device | `policy_denied` |
-| D14 | Correct user and device, wrong resource | `policy_denied` |
-| D15 | Frame larger than `MAX_FRAME_PAYLOAD` | `limit_frame_too_large` |
-| D16 | More concurrent streams than the cap | `limit_streams_exceeded` |
-| D17 | Session exceeds `max_bytes` | `limit_bytes_exceeded` |
-| D18 | Unsupported protocol version in HELLO | `protocol_version_unsupported` |
-| D19 | Malformed, truncated, or garbage frame | `protocol_malformed_frame` |
+| D5 | Grant with one byte flipped | `grant_invalid_signature` | **implemented** |
+| D6 | Grant past `expires_at` | `grant_expired` | **implemented** |
+| D7 | Grant with future `issued_at` beyond skew | `grant_not_yet_valid` | **implemented** |
+| D8 | Grant for device A presented at device B | `grant_device_mismatch` | **implemented** |
+| D9 | Revoked grant | `grant_revoked` | not implemented |
+| D10 | Resource ID absent from the local allowlist | `resource_unknown` | **implemented** |
+| D11 | Resource configured with a non-loopback target | agent refuses to start | **implemented** |
+| D12 | User with no matching policy requests a grant | `policy_denied` | **implemented** |
+| D13 | Correct user, wrong device | `policy_denied` | **implemented** |
+| D14 | Correct user and device, wrong resource | `policy_denied` | **implemented** |
+| D15 | Frame larger than `MAX_FRAME_PAYLOAD` | `limit_frame_too_large` | **implemented** |
+| D16 | More concurrent streams than the cap | `limit_streams_exceeded` | **implemented** |
+| D17 | Session exceeds `max_bytes` | `limit_bytes_exceeded` | not implemented |
+| D18 | Unsupported protocol version in HELLO | `protocol_version_unsupported` | **implemented** |
+| D19 | Malformed, truncated, or garbage frame | `protocol_malformed_frame` | **implemented** |
 
 D11 deserves emphasis: it is a **startup** failure, not a runtime denial. A misconfigured
 allowlist must never produce a running agent.

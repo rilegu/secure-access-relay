@@ -20,6 +20,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -28,6 +29,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/rilegu/secure-access-relay/internal/ca"
@@ -37,10 +39,11 @@ import (
 
 // File names within the state directory.
 const (
-	keyFile  = "identity.key"
-	certFile = "identity.crt"
-	caFile   = "ca.crt"
-	metaFile = "identity.json"
+	keyFile      = "identity.key"
+	certFile     = "identity.crt"
+	caFile       = "ca.crt"
+	metaFile     = "identity.json"
+	grantKeyFile = "grant-signing.pub"
 )
 
 // ErrNotEnrolled means this peer has no identity yet.
@@ -66,6 +69,11 @@ type Identity struct {
 
 	// NotAfter is when the certificate expires.
 	NotAfter time.Time
+
+	// GrantKey verifies grants. An agent that authenticates but cannot verify
+	// grants would have to trust the relay's word about what is authorized,
+	// which is exactly what invariant 2 forbids.
+	GrantKey ed25519.PublicKey
 }
 
 type meta struct {
@@ -123,6 +131,17 @@ func Load(dir string) (*Identity, error) {
 		_ = json.Unmarshal(b, &m)
 	}
 
+	// The grant key is optional on load so that an identity enrolled before
+	// grants existed still loads. A component that needs it checks for itself
+	// rather than every caller being forced to handle its absence here.
+	var grantKey ed25519.PublicKey
+	if b, err := os.ReadFile(filepath.Join(dir, grantKeyFile)); err == nil {
+		if raw, derr := base64.StdEncoding.DecodeString(strings.TrimSpace(string(b))); derr == nil &&
+			len(raw) == ed25519.PublicKeySize {
+			grantKey = ed25519.PublicKey(raw)
+		}
+	}
+
 	return &Identity{
 		Certificate: cert,
 		CAPool:      pool,
@@ -130,6 +149,7 @@ func Load(dir string) (*Identity, error) {
 		ServerName:  m.ServerName,
 		Protection:  protection,
 		NotAfter:    leaf.NotAfter,
+		GrantKey:    grantKey,
 	}, nil
 }
 
@@ -181,6 +201,11 @@ func Enroll(ctx context.Context, code enrollment.Code, dir string) (*Identity, e
 	if err := os.WriteFile(filepath.Join(dir, metaFile), m, 0o600); err != nil {
 		return nil, fmt.Errorf("write identity metadata: %w", err)
 	}
+	if resp.GrantKey != "" {
+		if err := os.WriteFile(filepath.Join(dir, grantKeyFile), []byte(resp.GrantKey), 0o600); err != nil {
+			return nil, fmt.Errorf("write grant verification key: %w", err)
+		}
+	}
 
 	return Load(dir)
 }
@@ -207,6 +232,7 @@ type enrollResponse struct {
 	CA          string `json:"ca"`
 	Identity    string `json:"identity"`
 	NotAfter    string `json:"not_after"`
+	GrantKey    string `json:"grant_key"`
 	Error       string `json:"error"`
 }
 

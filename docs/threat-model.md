@@ -46,10 +46,10 @@ Assumed **out of scope** (stated so the boundary is honest, not because they are
 | # | Threat | Control |
 | - | ------ | ------- |
 | T1 | Attacker reaches the endpoint directly from the internet | Agent never listens on a network interface. Outbound connections only. No inbound rule is created by the installer. |
-| T2 | Compromised relay opens a stream on its own authority | Agent independently verifies the Ed25519 grant signature, expiry, and `device_id` before dialing. Relay possesses no signing key. **Grant verification not yet implemented**; the relay is currently trusted to decide that a stream may open. |
+| T2 | Compromised relay opens a stream on its own authority | Agent independently verifies the Ed25519 grant signature, expiry, and `device_id` before dialing. Relay possesses no signing key and its own check is a fast fail only. **Implemented.** |
 | T3 | Compromised relay reads payload | Data plane is TLS between operator and agent; relay forwards ciphertext. (v1 caveat below.) |
 | T4 | Grant replayed after expiry | `expires_at` checked at the agent against local clock; max TTL 30 minutes; skew tolerance bounded and explicit. |
-| T5 | Grant tampered with (extended TTL, swapped resource) | Whole grant is signed; any field change invalidates the signature. |
+| T5 | Grant tampered with (extended TTL, swapped resource) | Whole grant is signed over a canonical encoding; any field change invalidates the signature. Coverage is checked by flipping every bit in turn. **Implemented.** |
 | T6 | Grant for device A replayed at device B | `device_id` is inside the signed grant and compared with the agent's own identity. Device identity itself is now certificate-bound: a peer cannot present one identity and claim another. |
 | T7 | Operator requests a LAN or internet target | Target address is never operator-supplied. The operator names a `resource_id`; the agent resolves it in its own local allowlist, and rejects any non-loopback target. |
 | T8 | Enrollment token reused to enroll a second device | Tokens are single-use, short-lived, and marked consumed transactionally on first use. Only a hash is stored, so a leaked store yields no usable tokens. **Implemented.** |
@@ -59,7 +59,7 @@ Assumed **out of scope** (stated so the boundary is honest, not because they are
 | T12 | Resource exhaustion via stream or frame flooding | Per-connection max frame size, concurrent stream cap negotiated at the handshake, credit-based flow control, bounded buffers, read deadlines. A peer exceeding its window is disconnected rather than buffered for. **Implemented.** |
 | T13 | Malformed protocol input causes crash or overread | Length-prefixed frames validated against limits before allocation; fuzz tests over the codec. |
 | T14 | Secrets leak through logs or the support bundle | Central redaction layer; tokens, keys, signatures, and payload bytes never reach a log sink; support bundle is generated through the same redactor. |
-| T15 | Failure of the control plane widens access | Deny-by-default on any authorization error, timeout, or signature-verification failure. There is no permissive fallback path. |
+| T15 | Failure of the control plane widens access | Deny-by-default on any authorization error, timeout, or signature-verification failure. No policy file means no access. Grants verify offline, so a control-plane outage stops new grants without severing sessions already authorized. **Implemented.** |
 | T16 | Stale WFP filters persist after a crash and break networking | Dynamic WFP session — filters are removed by the OS when the engine handle closes. Boot-time filters are not used in v1. |
 | T17 | Native DLL is replaced with a hostile one | DLL loaded by absolute path from the ACL-protected install directory, Authenticode signature verified before load, never from `%PATH%` or the working directory. |
 | T18 | Audit gaps hide an incident | Security-relevant decisions emit an audit event before the action completes; denials are audited with the same weight as allows. |
@@ -71,6 +71,15 @@ code and some are not, and the difference must be read before the table is.
 
 **Enforced today:**
 
+- **Every stream requires a signed grant**, verified by the endpoint agent itself against
+  a key obtained at enrollment. The relay's check is a fast fail, not the decision.
+- **Deny by default.** No policy means no access. There are no deny rules and no
+  wildcards, so evaluation order cannot change an answer.
+- **Resources are declared by the agent**, never named by an address on the wire. A
+  resource file with a non-loopback target stops the agent starting.
+- **Grant lifetime is capped at thirty minutes**, enforced when issued and again when
+  verified, so a compromised issuer cannot mint a long-lived one.
+- **Expiry closes running sessions**, not only new ones.
 - **Mutual TLS on every data-plane connection.** A peer without a certificate from this
   deployment's authority is refused during the TLS handshake, before it can send a
   protocol frame.
@@ -88,12 +97,15 @@ code and some are not, and the difference must be read before the table is.
 
 **Not yet implemented:**
 
-- **There is no authorization.** Any enrolled operator may reach any enrolled device.
-  There is no policy engine, no grant, and nothing verified before a stream is opened.
-  T5, the grant component of T7, and T15 are unimplemented, and this is the largest
+- **There is no audit trail.** Grants, denials, and sessions are all logged with the
+  identifiers needed to reconstruct what happened, but there is no queryable append-only
+  record and nothing is tamper-evident. T18 is unimplemented, and this is now the largest
   remaining gap.
-- **There is no audit trail.** Sessions and streams are logged, but there is no
-  queryable append-only record. T18 is unimplemented.
+- **Grants cannot be revoked before they expire.** Expiry is the only mechanism, bounded
+  at thirty minutes. Revoking a device or an operator stops *new* grants immediately, but
+  one already issued remains valid for its remaining life.
+- **Grants are not persisted.** They are signed and forgotten, so there is no record of
+  what was issued beyond the log line, and no list to revoke from.
 - **Revocation does not terminate live sessions.** It is checked when a connection is
   established, so a session already running continues until it ends. T10 is therefore
   only partially mitigated: restarting the relay is currently the way to drop them.

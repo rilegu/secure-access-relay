@@ -1,6 +1,7 @@
 package enrollment
 
 import (
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/base64"
@@ -49,15 +50,24 @@ type Service struct {
 	store *storage.Store
 	ca    *ca.CA
 
+	// grantPub is the public half of the grant signing key, handed to every peer
+	// at enrollment.
+	//
+	// Distributing it here rather than through a separate channel is what lets an
+	// agent verify grants offline: by the time it can connect at all, it already
+	// holds the key it needs to check what it is asked to do.
+	grantPub ed25519.PublicKey
+
 	tokenTTL time.Duration
 	certTTL  time.Duration
 }
 
 // New creates an enrollment service.
-func New(store *storage.Store, authority *ca.CA) *Service {
+func New(store *storage.Store, authority *ca.CA, grantPub ed25519.PublicKey) *Service {
 	return &Service{
 		store:    store,
 		ca:       authority,
+		grantPub: grantPub,
 		tokenTTL: DefaultTokenTTL,
 		certTTL:  DefaultCertTTL,
 	}
@@ -107,6 +117,10 @@ type Result struct {
 	Identity ca.Identity
 	// NotAfter is when the certificate stops being valid.
 	NotAfter time.Time
+	// GrantPublicKey verifies grants. An agent cannot enforce authorization
+	// without it, so it is delivered with the certificate rather than fetched
+	// later.
+	GrantPublicKey ed25519.PublicKey
 }
 
 // Enroll consumes a token and issues a certificate for the identity it names.
@@ -158,6 +172,7 @@ func (s *Service) Enroll(token string, csrPEM []byte) (*Result, error) {
 		CAPEM:          s.ca.CertPEM(),
 		Identity:       id,
 		NotAfter:       cert.NotAfter,
+		GrantPublicKey: s.grantPub,
 	}, nil
 }
 

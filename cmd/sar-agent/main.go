@@ -125,7 +125,9 @@ func cmdRun(args []string) error {
 	var (
 		relayAddr  = fs.String("relay-addr", "127.0.0.1:17070", "relay address to connect out to")
 		stateDir   = fs.String("state-dir", "agent-state", "directory holding the key and certificate")
-		target     = fs.String("target", "127.0.0.1:8080", "local service to expose; must be a loopback literal with an explicit port")
+		resources  = fs.String("resources", "", "path to a resources.json declaring what this agent serves")
+		target     = fs.String("target", "", "shorthand for a single resource; must be a loopback literal with an explicit port")
+		resourceID = fs.String("resource-id", "res_default", "resource identifier when -target is used")
 		maxStreams = fs.Uint("max-streams", 16, "maximum concurrent streams the relay may open")
 		retry      = fs.Duration("retry-interval", 2*time.Second, "delay between reconnection attempts")
 		logLevel   = fs.String("log-level", "info", "log level: debug, info, warn, error")
@@ -151,13 +153,18 @@ func cmdRun(args []string) error {
 		return err
 	}
 
-	// A target that is not loopback fails startup rather than being rejected
+	// A resource that is not loopback fails startup rather than being rejected
 	// later at stream time. A misconfigured allowlist must never produce a
 	// running agent (invariant 4).
+	allowlist, err := resolveResources(*resources, *target, *resourceID)
+	if err != nil {
+		return err
+	}
+
 	a, err := agent.New(agent.Config{
 		RelayAddr:     *relayAddr,
 		Identity:      id,
-		Target:        *target,
+		Resources:     allowlist,
 		MaxStreams:    uint32(*maxStreams),
 		RetryInterval: *retry,
 		Logger:        log,
@@ -192,4 +199,38 @@ func cmdRun(args []string) error {
 		log.Info("shutdown complete")
 		return nil
 	})
+}
+
+// resolveResources builds the allowlist from either a resource file or the
+// single-resource shorthand.
+//
+// The file is the real mechanism; the shorthand exists so a one-resource
+// endpoint does not need a file to try the system. Both paths go through the
+// same validation, so the shorthand cannot express anything the file could not.
+func resolveResources(path, target, resourceID string) (agent.Allowlist, error) {
+	switch {
+	case path != "" && target != "":
+		// Two sources of truth for what this agent serves. Refusing is better
+		// than picking one, because the operator believes both are in effect.
+		return nil, errors.New("give either -resources or -target, not both")
+
+	case path != "":
+		return agent.LoadAllowlist(path)
+
+	case target != "":
+		if resourceID == "" {
+			return nil, errors.New("-resource-id is required with -target")
+		}
+		return agent.Allowlist{
+			resourceID: {
+				ResourceID: resourceID,
+				Name:       resourceID,
+				Protocol:   "tcp",
+				Target:     target,
+			},
+		}, nil
+
+	default:
+		return nil, errors.New("nothing to serve: give -resources <file> or -target <127.0.0.1:port>")
+	}
 }

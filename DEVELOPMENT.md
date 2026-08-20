@@ -85,7 +85,7 @@ internal/
   agent/         endpoint runtime: session, target validation, stream handling
   operator/      operator-side forwarder: local listener, one session, many streams
   relay/         relay server; sessions/ (registry) authorization/
-  control/       enrollment/ httpapi/ ... resources/ policy/ grants/ audit/
+  control/       enrollment/ httpapi/ policy/ grants/ ... resources/ audit/
   storage/       enrolled identities and enrollment tokens
   config/ logging/
   e2e/           every component wired together in one process

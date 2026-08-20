@@ -9,12 +9,14 @@
 package e2e
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -23,21 +25,43 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/rilegu/secure-access-relay/internal/agent"
 	"github.com/rilegu/secure-access-relay/internal/ca"
 	"github.com/rilegu/secure-access-relay/internal/control/enrollment"
+	"github.com/rilegu/secure-access-relay/internal/control/grants"
+	"github.com/rilegu/secure-access-relay/internal/control/httpapi"
+	"github.com/rilegu/secure-access-relay/internal/control/policy"
 	"github.com/rilegu/secure-access-relay/internal/identity"
+	"github.com/rilegu/secure-access-relay/internal/mux"
 	"github.com/rilegu/secure-access-relay/internal/operator"
+	"github.com/rilegu/secure-access-relay/internal/proto"
 	"github.com/rilegu/secure-access-relay/internal/relay"
 	"github.com/rilegu/secure-access-relay/internal/storage"
 	"github.com/rilegu/secure-access-relay/internal/transport"
 )
 
-// testDeviceID is the endpoint identity used throughout these tests.
-const testDeviceID = "dev_test_endpoint"
+// Identities and the resource used throughout these tests.
+const (
+	testDeviceID   = "dev_test_endpoint"
+	testUserID     = "usr_test"
+	testResourceID = "res_fixture"
+)
+
+// testAllowlist is the agent's resource declaration for the harness.
+func testAllowlist(target string) agent.Allowlist {
+	return agent.Allowlist{
+		testResourceID: {
+			ResourceID: testResourceID,
+			Name:       "fixture",
+			Protocol:   "tcp",
+			Target:     target,
+		},
+	}
+}
 
 // discardLogger keeps component output out of test results. A failing test is
 // diagnosed by its assertions; the log volume from four chatty components would
@@ -53,7 +77,11 @@ type deployment struct {
 	authority  *ca.CA
 	store      *storage.Store
 	enroll     *enrollment.Service
+	issuer     *grants.Issuer
+	rules      []policy.Rule
 	serverCert tls.Certificate
+
+	controlAddr string
 }
 
 func newDeployment(t *testing.T) *deployment {
@@ -72,13 +100,64 @@ func newDeployment(t *testing.T) *deployment {
 		t.Fatalf("issue server certificate: %v", err)
 	}
 
+	_, signingKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	issuer, err := grants.NewIssuer(signingKey, "key_test")
+	if err != nil {
+		t.Fatalf("create issuer: %v", err)
+	}
+
 	return &deployment{
 		t:          t,
 		authority:  authority,
 		store:      store,
-		enroll:     enrollment.New(store, authority),
+		enroll:     enrollment.New(store, authority, issuer.PublicKey()),
+		issuer:     issuer,
 		serverCert: serverCert,
+		// Allows the standard test operator to reach the standard test resource
+		// on the standard test device, and nothing else. Tests that need a
+		// different answer replace this.
+		rules: []policy.Rule{{
+			PolicyID:   "pol_test",
+			Principals: []string{testUserID},
+			Devices:    []string{testDeviceID},
+			Resources:  []string{testResourceID},
+			MaxTTL:     policy.Duration(20 * time.Minute),
+			Effect:     policy.EffectAllow,
+		}},
 	}
+}
+
+// startControlPlane runs the enrollment and grants API.
+//
+// Client certificates are verified if presented but not required, because
+// enrollment cannot demand one — a peer enrolls precisely because it has none.
+// Each route decides for itself, which is what the grants handler does.
+func (d *deployment) startControlPlane(ctx context.Context) {
+	d.t.Helper()
+
+	tlsCfg := &tls.Config{
+		Certificates: []tls.Certificate{d.serverCert},
+		MinVersion:   transport.MinTLSVersion,
+		ClientAuth:   tls.VerifyClientCertIfGiven,
+		ClientCAs:    d.authority.Pool(),
+	}
+
+	srv, err := httpapi.New(httpapi.Config{
+		Addr:   "127.0.0.1:0",
+		TLS:    tlsCfg,
+		Issuer: d.issuer,
+		Rules:  func() []policy.Rule { return d.rules },
+		Logger: discardLogger(),
+	}, d.enroll)
+	if err != nil {
+		d.t.Fatalf("create control plane: %v", err)
+	}
+	go func() { _ = srv.Run(ctx) }()
+	waitReady(d.t, srv.Ready(), "control plane")
+	d.controlAddr = srv.Addr()
 }
 
 // enrollIdentity issues credentials the way a real peer obtains them.
@@ -136,6 +215,7 @@ func (d *deployment) identityFrom(certPEM []byte, priv ed25519.PrivateKey) *iden
 		ID:          certID,
 		ServerName:  "localhost",
 		NotAfter:    leaf.NotAfter,
+		GrantKey:    d.issuer.PublicKey(),
 	}
 }
 
@@ -147,6 +227,7 @@ func (d *deployment) startRelay(ctx context.Context, maxStreams uint32) *relay.S
 		Addr:       "127.0.0.1:0",
 		TLS:        transport.ServerTLS(d.serverCert, d.authority.Pool()),
 		Verify:     d.enroll,
+		GrantKey:   d.issuer.PublicKey(),
 		MaxStreams: maxStreams,
 		Logger:     discardLogger(),
 	})
@@ -183,6 +264,7 @@ type harness struct {
 	Fixture   *httptest.Server
 	Relay     *relay.Server
 	Forwarder *operator.Forwarder
+	counter   *countingFixture
 
 	// ForwardURL is the base URL a test client should call. Requests to it
 	// traverse the entire chain.
@@ -197,13 +279,19 @@ type options struct {
 	target string
 	// maxStreams overrides the concurrent stream limit.
 	maxStreams uint32
+	// rules replaces the default policy.
+	rules []policy.Rule
+	// useCounter makes the fixture count requests, for denial tests.
+	useCounter bool
 }
 
 // newHarness starts every component and waits until the chain is ready.
 //
 // Everything binds to port 0 and every component is shut down through the test's
 // cleanup, so tests can run in parallel and leave nothing behind.
-func newHarness(t *testing.T, opt options) *harness {
+func newHarness(t *testing.T, opt options) *harness { return buildHarness(t, opt) }
+
+func buildHarness(t *testing.T, opt options) *harness {
 	t.Helper()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -212,12 +300,21 @@ func newHarness(t *testing.T, opt options) *harness {
 	log := discardLogger()
 	h := &harness{t: t, Dep: newDeployment(t)}
 
+	if opt.rules != nil || len(opt.rules) == 0 && opt.useCounter {
+		h.Dep.rules = opt.rules
+	}
+
 	// The approved local service. httptest binds 127.0.0.1, which is the point:
 	// it is only reachable from this machine.
-	h.Fixture = httptest.NewServer(fixtureHandler())
-	t.Cleanup(h.Fixture.Close)
-
-	target := h.Fixture.Listener.Addr().String()
+	var target string
+	if opt.useCounter {
+		h.counter = newCountingFixture(t)
+		target = h.counter.addr
+	} else {
+		h.Fixture = httptest.NewServer(fixtureHandler())
+		t.Cleanup(h.Fixture.Close)
+		target = h.Fixture.Listener.Addr().String()
+	}
 	if opt.target != "" {
 		target = opt.target
 	}
@@ -227,13 +324,14 @@ func newHarness(t *testing.T, opt options) *harness {
 		maxStreams = opt.maxStreams
 	}
 
+	h.Dep.startControlPlane(ctx)
 	h.Relay = h.Dep.startRelay(ctx, maxStreams)
 
 	if !opt.skipAgent {
 		a, err := agent.New(agent.Config{
 			RelayAddr:     h.Relay.Addr(),
 			Identity:      h.Dep.enrollIdentity(ca.RoleDevice, testDeviceID),
-			Target:        target,
+			Resources:     testAllowlist(target),
 			MaxStreams:    maxStreams,
 			RetryInterval: 20 * time.Millisecond, // fast reconnect keeps tests brief
 			Logger:        log,
@@ -246,12 +344,13 @@ func newHarness(t *testing.T, opt options) *harness {
 	}
 
 	f, err := operator.New(operator.Config{
-		RelayAddr:  h.Relay.Addr(),
-		Identity:   h.Dep.enrollIdentity(ca.RoleOperator, "usr_test"),
-		ListenAddr: "127.0.0.1:0",
-		DeviceID:   testDeviceID,
-		Resource:   "fixture",
-		Logger:     log,
+		RelayAddr:   h.Relay.Addr(),
+		ControlAddr: h.Dep.controlAddr,
+		Identity:    h.Dep.enrollIdentity(ca.RoleOperator, testUserID),
+		ListenAddr:  "127.0.0.1:0",
+		DeviceID:    testDeviceID,
+		Resource:    testResourceID,
+		Logger:      log,
 	})
 	if err != nil {
 		t.Fatalf("create forwarder: %v", err)
@@ -373,3 +472,111 @@ type identityLike struct {
 // emptyCert is a credential with no certificate, for testing that the relay
 // requires one.
 func emptyCert() tls.Certificate { return tls.Certificate{} }
+
+// countingFixture is an endpoint service that records how many requests reach
+// it.
+//
+// Denial tests assert on this rather than only on the client seeing an error: a
+// request that failed at the client while still reaching the target would be a
+// denial in name only.
+type countingFixture struct {
+	srv  *httptest.Server
+	addr string
+	n    atomic.Int32
+}
+
+func newCountingFixture(t *testing.T) *countingFixture {
+	t.Helper()
+	f := &countingFixture{}
+	inner := fixtureHandler()
+	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.n.Add(1)
+		inner.ServeHTTP(w, r)
+	}))
+	t.Cleanup(f.srv.Close)
+	f.addr = f.srv.Listener.Addr().String()
+	return f
+}
+
+func (f *countingFixture) hits() int32 { return f.n.Load() }
+
+// FixtureHits reports how many requests reached the harness's endpoint service.
+func (h *harness) FixtureHits() int32 {
+	if h.counter == nil {
+		return 0
+	}
+	return h.counter.hits()
+}
+
+// newHarnessWithRules builds a chain whose policy the caller supplies.
+func newHarnessWithRules(t *testing.T, rules []policy.Rule) *harness {
+	t.Helper()
+	return buildHarness(t, options{rules: rules, useCounter: true})
+}
+
+// dialAndOpen presents credentials and a grant directly to the relay, bypassing
+// the operator package so a test can send what that package would refuse to
+// construct.
+func dialAndOpen(t *testing.T, relayAddr string, id *identity.Identity, deviceID string, grantBytes []byte) error {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, err := transport.DialTLS(ctx, relayAddr,
+		transport.ClientTLS(id.Certificate, id.CAPool, "localhost"))
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close() }()
+
+	sess, err := mux.Dial(ctx, conn, mux.Config{Role: proto.RoleOperator, Logger: discardLogger()},
+		proto.Auth{DeviceID: deviceID, Resource: testResourceID})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = sess.Close(proto.ReasonShutdown) }()
+
+	st, err := sess.Open(ctx, grantBytes)
+	if err != nil {
+		return err
+	}
+	// A stream that opens may still be reset immediately by the agent, so read
+	// once to find out whether it was really granted.
+	_ = st.CloseWrite()
+	buf := make([]byte, 1)
+	if _, err := st.Read(buf); err != nil && err != io.EOF {
+		return err
+	}
+	return nil
+}
+
+// postGrant asks the control plane for a grant, optionally without credentials.
+func postGrant(t *testing.T, controlAddr string, id *identity.Identity, deviceID, resourceID string) (string, int, error) {
+	t.Helper()
+
+	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS13, InsecureSkipVerify: true}
+	if id != nil {
+		tlsCfg.Certificates = []tls.Certificate{id.Certificate}
+	}
+	client := &http.Client{Timeout: 10 * time.Second,
+		Transport: &http.Transport{TLSClientConfig: tlsCfg}}
+
+	body, _ := json.Marshal(map[string]any{
+		"device_id": deviceID, "resource_id": resourceID, "ttl_seconds": 600,
+	})
+	req, err := http.NewRequest(http.MethodPost, "https://"+controlAddr+"/v1/grants", bytes.NewReader(body))
+	if err != nil {
+		return "", 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", 0, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	out, _ := io.ReadAll(resp.Body)
+	return string(out), resp.StatusCode, nil
+}

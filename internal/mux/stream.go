@@ -60,6 +60,16 @@ type Stream struct {
 	// read, which would double the frame count on a busy stream.
 	pendingCredit uint32
 
+	// openPayload is what the peer sent when it opened this stream. For a stream
+	// opened toward an agent it carries the signed grant, which is the only thing
+	// that authorizes the stream to exist at all.
+	//
+	// Copied on receipt, never aliased: the codec reuses its read buffer, so a
+	// retained payload would be rewritten underneath whoever verifies it — which
+	// on this path would mean verifying a signature over bytes that are no longer
+	// the bytes being acted on.
+	openPayload []byte
+
 	localClosed  bool
 	remoteClosed bool
 	resetReason  proto.Reason
@@ -80,6 +90,12 @@ func newStream(id uint32, s *Session, window uint32) *Stream {
 
 // ID returns the stream identifier, for logs and audit.
 func (s *Stream) ID() uint32 { return s.id }
+
+// OpenPayload returns what the peer sent when opening this stream.
+//
+// It is nil for a stream this side opened. The bytes are owned by the stream and
+// must not be modified.
+func (s *Stream) OpenPayload() []byte { return s.openPayload }
 
 // Read implements io.Reader.
 //

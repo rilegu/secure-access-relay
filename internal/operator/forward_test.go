@@ -59,6 +59,7 @@ func TestNewRejectsNonLoopbackListen(t *testing.T) {
 		RelayAddr:  "127.0.0.1:1",
 		Identity:   &identity.Identity{},
 		DeviceID:   "dev_test",
+		Resource:   "res_test",
 		ListenAddr: "0.0.0.0:18080",
 	})
 	if !errors.Is(err, ErrListenNotLoopback) {
@@ -71,7 +72,12 @@ func TestNewRejectsNonLoopbackListen(t *testing.T) {
 // The device is what the operator is asking for; without it the relay has nothing
 // to route to. Who is asking comes from the certificate, not from a flag.
 func TestNewRequiresDeviceID(t *testing.T) {
-	_, err := New(Config{RelayAddr: "127.0.0.1:1", Identity: &identity.Identity{}, ListenAddr: "127.0.0.1:0"})
+	_, err := New(Config{
+		RelayAddr:  "127.0.0.1:1",
+		Identity:   &identity.Identity{},
+		Resource:   "res_test",
+		ListenAddr: "127.0.0.1:0",
+	})
 	if err == nil {
 		t.Fatal("New succeeded without a device id")
 	}
@@ -79,7 +85,24 @@ func TestNewRequiresDeviceID(t *testing.T) {
 
 // TestNewRequiresIdentity checks that a forward cannot start without credentials.
 func TestNewRequiresIdentity(t *testing.T) {
-	if _, err := New(Config{RelayAddr: "127.0.0.1:1", DeviceID: "dev", ListenAddr: "127.0.0.1:0"}); err == nil {
+	cfg := Config{RelayAddr: "127.0.0.1:1", DeviceID: "dev", Resource: "res", ListenAddr: "127.0.0.1:0"}
+	if _, err := New(cfg); err == nil {
 		t.Fatal("New succeeded without an identity")
+	}
+}
+
+// TestNewRequiresResource checks a forward must name what it wants to reach.
+//
+// The resource is what a grant is issued for, so a forward without one could
+// never be authorized. Failing at construction says so plainly.
+func TestNewRequiresResource(t *testing.T) {
+	cfg := Config{
+		RelayAddr:  "127.0.0.1:1",
+		Identity:   &identity.Identity{},
+		DeviceID:   "dev",
+		ListenAddr: "127.0.0.1:0",
+	}
+	if _, err := New(cfg); err == nil {
+		t.Fatal("New succeeded without a resource")
 	}
 }

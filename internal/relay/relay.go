@@ -16,14 +16,23 @@
 // an identity that disagrees with its certificate, the connection is refused
 // rather than reconciled.
 //
+// # Authorization
+//
+// Every stream carries a signed grant. The relay checks it, but only to fail
+// fast: the endpoint agent verifies the same grant independently, against a key
+// it obtained at enrollment, before it dials anything. If this check were the
+// only one, a compromised relay could open any stream it liked — which is
+// exactly what invariant 2 forbids.
+//
 // # Not finished
 //
-// There is still no authorization. An enrolled operator may reach any enrolled
-// device, because policy and grants do not exist yet.
+// There is no queryable audit trail, and a grant cannot be revoked before it
+// expires.
 package relay
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
@@ -68,6 +77,14 @@ type Config struct {
 	// Verify resolves a peer certificate to an enrolled identity.
 	Verify Verifier
 
+	// GrantKey verifies grants presented by operators.
+	//
+	// The relay checking a grant is a convenience that fails fast, never a
+	// control: the agent verifies independently and is authoritative. If this
+	// check were the only one, a compromised relay could open any stream it
+	// liked, which is precisely what invariant 2 forbids.
+	GrantKey ed25519.PublicKey
+
 	// MaxStreams caps concurrent streams per session.
 	MaxStreams uint32
 
@@ -106,6 +123,9 @@ func New(cfg Config) (*Server, error) {
 	}
 	if cfg.Verify == nil {
 		return nil, errors.New("relay: refusing to start without a certificate verifier")
+	}
+	if cfg.GrantKey == nil {
+		return nil, errors.New("relay: refusing to start without a grant verification key")
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -380,22 +400,72 @@ func (s *Server) serveOperator(ctx context.Context, h *mux.Handshake, id ca.Iden
 		wg.Add(1)
 		go func(st *mux.Stream) {
 			defer wg.Done()
-			s.joinStream(ctx, log, st, agentSess, h.Auth.Resource)
+			s.joinStream(ctx, log, st, agentSess, deviceID, id.ID)
 		}(st)
 	}
 }
 
-// joinStream opens a matching stream on the agent and bridges the two.
-func (s *Server) joinStream(ctx context.Context, log *slog.Logger, op *mux.Stream, agentSess *mux.Session, resource string) {
+// joinStream authorizes an operator's stream and joins it to the agent.
+//
+// The relay's checks here are a fast fail, not the decision. A grant that passes
+// them is still verified independently by the agent, which is what makes a
+// compromised relay unable to reach an endpoint service. Checking here anyway
+// means an operator learns immediately why a request was refused, instead of
+// after a round trip to a machine that was never going to accept it.
+func (s *Server) joinStream(ctx context.Context, log *slog.Logger, op *mux.Stream,
+	agentSess *mux.Session, deviceID, userID string) {
+
 	log = log.With("operator_stream", op.ID())
 
+	payload := op.OpenPayload()
+	if len(payload) == 0 {
+		log.Info("stream refused", "reason", proto.ReasonPolicyDenied.String(), "detail", "no grant presented")
+		_ = op.Reset(proto.ReasonPolicyDenied)
+		return
+	}
+
+	grant, err := proto.DecodeGrant(payload)
+	if err != nil {
+		log.Info("stream refused", "reason", proto.ReasonForGrant(err).String(), "error", err)
+		_ = op.Reset(proto.ReasonForGrant(err))
+		return
+	}
+
+	// Verified against the grant's own device, not this relay's view of it, so
+	// the signature check is exactly the one the agent will repeat.
+	if err := grant.Verify(s.cfg.GrantKey, time.Now(), grant.DeviceID); err != nil {
+		reason := proto.ReasonForGrant(err)
+		log.Info("stream refused", "reason", reason.String(), "grant_id", grant.GrantID, "error", err)
+		_ = op.Reset(reason)
+		return
+	}
+
+	// A valid grant belonging to somebody else, or for a different endpoint, is
+	// still a refusal. Both are inside the signature, so this catches an operator
+	// presenting a grant that was legitimately issued — to another person, or for
+	// another machine.
+	if grant.UserID != userID {
+		log.Warn("stream refused: grant belongs to another user",
+			"grant_user", grant.UserID, "certificate_user", userID)
+		_ = op.Reset(proto.ReasonPolicyDenied)
+		return
+	}
+	if grant.DeviceID != deviceID {
+		log.Warn("stream refused: grant is for another device",
+			"grant_device", grant.DeviceID, "session_device", deviceID)
+		_ = op.Reset(proto.ReasonGrantDeviceMismatch)
+		return
+	}
+
+	log = log.With("grant_id", grant.GrantID, "resource_id", grant.ResourceID)
+
 	openCtx, cancel := context.WithTimeout(ctx, proto.DialTimeout+time.Second)
-	agentStream, err := agentSess.Open(openCtx)
+	// The same grant bytes are forwarded unchanged. The relay does not re-sign,
+	// re-encode, or amend anything: the agent must verify exactly what the
+	// control plane issued.
+	agentStream, err := agentSess.Open(openCtx, payload)
 	cancel()
 	if err != nil {
-		// The endpoint could not take another stream, or its session died. Either
-		// way this is availability, not authorization, and the operator is told so
-		// rather than being left waiting.
 		reason := proto.ReasonNoAgent
 		if errors.Is(err, mux.ErrTooManyStreams) || errors.Is(err, mux.ErrStreamRefused) {
 			reason = proto.ReasonLimitStreamsExceeded
@@ -406,11 +476,11 @@ func (s *Server) joinStream(ctx context.Context, log *slog.Logger, op *mux.Strea
 	}
 
 	start := time.Now()
-	log.Info("stream joined", "agent_stream", agentStream.ID(), "resource", resource)
+	log.Info("stream joined", "agent_stream", agentStream.ID())
 
 	stats, joinErr := bridge.Join(op, agentStream)
 
-	// The shape of an audit record: what happened, how much, how long, and why it
+	// The shape of an audit record: who, what, how much, how long, and why it
 	// ended. Payload contents are deliberately absent (invariant 7).
 	reason := proto.ReasonOK
 	if joinErr != nil {

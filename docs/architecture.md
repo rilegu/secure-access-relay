@@ -56,7 +56,7 @@ the security layers:
 | `sarctl` | enrolls, opens one relay session carrying many streams. No login flow, no grant request, no audit query. |
 | Transport | **TLS 1.3, mutual, on every data-plane connection.** |
 | Identity | **from the certificate.** Enrolled, revocable, role-bound. |
-| Authorization | **none.** Any enrolled operator may reach any enrolled device. |
+| Authorization | **signed grants.** Policy decides, the agent enforces. No audit trail yet. |
 
 Enforced today:
 

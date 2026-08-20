@@ -41,6 +41,14 @@ type Config struct {
 	// request, not an identity claim: who is asking comes from the certificate.
 	DeviceID string
 
+	// ControlAddr is the control plane, where grants are requested.
+	ControlAddr string
+
+	// GrantTTL is how long a grant is asked for. The control plane caps it by
+	// policy and by the system maximum, so this is a request rather than a
+	// setting.
+	GrantTTL time.Duration
+
 	KeepAlive   time.Duration
 	IdleTimeout time.Duration
 
@@ -72,6 +80,9 @@ type Forwarder struct {
 	// the forward.
 	sessMu sync.Mutex
 	sess   *mux.Session
+
+	// grants holds the current authorization, refreshed as it ages.
+	grants grantCache
 }
 
 // New creates a forwarder, rejecting a non-loopback listen address.
@@ -90,6 +101,12 @@ func New(cfg Config) (*Forwarder, error) {
 	}
 	if cfg.DeviceID == "" {
 		return nil, errors.New("operator: device id is required")
+	}
+	if cfg.Resource == "" {
+		return nil, errors.New("operator: resource is required")
+	}
+	if cfg.GrantTTL <= 0 {
+		cfg.GrantTTL = proto.MaxGrantTTL
 	}
 	if err := validateListenAddr(cfg.ListenAddr); err != nil {
 		return nil, err
@@ -252,8 +269,17 @@ func (f *Forwarder) handle(ctx context.Context, local net.Conn) {
 		return
 	}
 
+	// A grant is obtained before the stream, so an unauthorized request fails
+	// here with the control plane's reason rather than as an opaque stream reset.
+	grantBytes, err := f.grant(ctx)
+	if err != nil {
+		log.Error("no grant", "error", err)
+		_ = local.Close()
+		return
+	}
+
 	openCtx, cancel := context.WithTimeout(ctx, proto.DialTimeout)
-	st, err := sess.Open(openCtx)
+	st, err := sess.Open(openCtx, grantBytes)
 	cancel()
 	if err != nil {
 		// The relay refused the stream. Its reason is in the error, and the local
