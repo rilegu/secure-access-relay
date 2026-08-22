@@ -219,17 +219,33 @@ looks like a real installation.
 
 ## Failure and resilience tests
 
-| Injection | Expected behavior |
-| --------- | ----------------- |
-| Kill relay mid-transfer | Streams close with a reason; agent reconnects with backoff and jitter |
-| Restart relay | Agent re-registers; stale sessions fenced, not duplicated |
-| Disable and re-enable the NIC | Network-change detection triggers reconnect |
-| Reboot Windows | Service auto-starts and reconnects without manual action |
-| Kill agent process | SCM restarts it; WFP filters released by the OS |
-| Revoke grant during an active session | Stream dropped at both ends, audited — **implemented**, D23 |
-| Clock skew beyond tolerance | Grants denied, with a skew-specific reason |
-| Control plane down, agent already connected | Existing streams survive to expiry; **new streams denied** |
-| Fill disk on the endpoint | Logging degrades; access decisions stay correct |
+| Injection | Expected behavior | Status |
+| --------- | ----------------- | ------ |
+| Kill relay mid-transfer | Streams close with a reason; agent reconnects with backoff and jitter | **implemented** |
+| Restart relay | Agent returns on its own to the same address; stale sessions fenced, not duplicated | **implemented** |
+| Revoke grant during an active session | Stream dropped at both ends, audited | **implemented**, D23 |
+| Clock skew beyond tolerance | Grants denied, with a reason that says which direction | **implemented** |
+| Control plane down, agent already connected | A held grant keeps working to expiry; a grant that must be obtained is refused | **implemented** |
+| Certificate renewal interrupted after issue | The endpoint keeps its current certificate and retries | **implemented** |
+| Audit trail fills the disk | Retention exists, is explicit, and records itself | **implemented** |
+| Disable and re-enable the NIC | Network-change detection triggers reconnect | code written, needs a real NIC |
+| Reboot Windows | Service auto-starts and reconnects without manual action | needs an elevated VM |
+| Kill agent process | SCM restarts it; WFP filters released by the OS | needs an elevated VM |
+| Fill disk on the endpoint | Logging degrades; access decisions stay correct | not implemented |
+
+The control-plane row is the one most easily written backwards, and both halves
+are asserted for that reason. An operator **holding a valid grant keeps working**
+— that is not a leak, it is the entire point of verifying grants offline, and a
+test that only checked for denial would pass on a system that had simply stopped.
+An operator who **needs a new grant is refused**, because there is nothing to
+authenticate against and nothing to record it in, and invariant 6 says a failure
+must never widen access.
+
+The reconnect row is covered twice, deliberately. `TestAgentReconnectsAfterRelayRestart`
+stops the relay and asserts the dead session is dropped; it cannot verify the
+return, because there is nothing to return to. `TestAgentReturnsAfterTheRelayRestarts`
+reserves the address first so the relay can come back on it, and asserts the agent
+reconnects with its configuration untouched.
 
 ## Cleanup tests
 

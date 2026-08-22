@@ -37,6 +37,12 @@ const (
 	EventOperatorRevoked  = "operator.revoked"
 	EventEnrollDenied     = "enroll.denied"
 
+	// Certificate renewal, which is authenticated by the certificate being
+	// replaced rather than by a token.
+	EventDeviceRenewed   = "device.renewed"
+	EventOperatorRenewed = "operator.renewed"
+	EventRenewDenied     = "renew.denied"
+
 	// Data-plane connection lifecycle.
 	EventDeviceConnected    = "device.connected"
 	EventDeviceDisconnected = "device.disconnected"
@@ -189,6 +195,29 @@ func (r *Recorder) Enrolled(ctx context.Context, role, id, detail string) {
 	event := EventDeviceEnrolled
 	if role == RoleOperator {
 		event = EventOperatorEnrolled
+	}
+	e := storage.AuditEvent{
+		Event:     event,
+		ActorRole: role,
+		ActorID:   id,
+		Detail:    detail,
+	}
+	if role == RoleDevice {
+		e.DeviceID = id
+	}
+	r.Record(ctx, e)
+}
+
+// Renewed records a certificate reissued to an identity that already held one.
+//
+// Recorded separately from enrollment because they are different events: an
+// enrollment means somebody minted a token and handed it over, a renewal means
+// an endpoint that was already trusted refreshed itself unattended. Conflating
+// them would make an unattended fleet look like continuous manual provisioning.
+func (r *Recorder) Renewed(ctx context.Context, role, id, detail string) {
+	event := EventDeviceRenewed
+	if role == RoleOperator {
+		event = EventOperatorRenewed
 	}
 	e := storage.AuditEvent{
 		Event:     event,

@@ -28,3 +28,9 @@ touched.
 | [0013](0013-canonical-grant-encoding.md) | Grants are signed over a hand-written canonical encoding | accepted |
 | [0014](0014-operator-sessions-not-a-second-factor.md) | Operator sessions are a revocation handle, not a second factor | accepted |
 | [0015](0015-revocation-reaches-live-streams.md) | Revocation drops live streams from the relay, not the agent | accepted |
+| [0016](0016-renewal-is-pending-until-used.md) | A renewed certificate is pending until it is used | accepted |
+| [0017](0017-audit-retention-is-the-one-exception.md) | Audit retention is the single exception to append-only | accepted |
+| [0016](0016-renewal-is-pending-until-used.md) | A renewed certificate is pending until it is used | accepted |
+| [0017](0017-audit-retention-is-the-one-exception.md) | Audit retention is the single exception to append-only | accepted |
+| [0016](0016-renewal-is-pending-until-used.md) | A renewed certificate is pending until it is used | accepted |
+| [0017](0017-audit-retention-is-the-one-exception.md) | Audit retention is the single exception to append-only | accepted |

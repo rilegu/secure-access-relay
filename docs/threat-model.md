@@ -113,8 +113,11 @@ code and some are not, and the difference must be read before the table is.
   continue until it ended or the grant expired.
 - **On platforms without DPAPI the key is protected by file permissions only.** Reported
   at startup rather than left to be assumed.
-- **Certificates are not renewed automatically.** They expire after thirty days and
-  re-enrollment is manual.
+- **A certificate that has already expired cannot renew itself.** Renewal is
+  authenticated by presenting the certificate being replaced, so an endpoint that
+  was off for longer than its remaining life needs a human and a new enrollment
+  token. The renewal window is ten days of a thirty-day life, so this requires an
+  endpoint to be offline for most of a month.
 - **The control plane is a single node.** SQLite means one writer, one machine, no
   replication, and no failover.
 

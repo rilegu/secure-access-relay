@@ -129,7 +129,9 @@ func cmdRun(args []string) error {
 		target     = fs.String("target", "", "shorthand for a single resource; must be a loopback literal with an explicit port")
 		resourceID = fs.String("resource-id", "res_default", "resource identifier when -target is used")
 		maxStreams = fs.Uint("max-streams", 16, "maximum concurrent streams the relay may open")
-		retry      = fs.Duration("retry-interval", 2*time.Second, "delay between reconnection attempts")
+		retry      = fs.Duration("retry-interval", 0, "ceiling on the first redial delay; grows with jitter (0 uses the default)")
+		maxRetry   = fs.Duration("max-retry-interval", 0, "ceiling on the grown redial delay (0 uses the default)")
+		controlAdr = fs.String("control-addr", "", "control-plane address, used to renew this certificate before it expires")
 		logLevel   = fs.String("log-level", "info", "log level: debug, info, warn, error")
 	)
 	_ = fs.Parse(args)
@@ -161,13 +163,29 @@ func cmdRun(args []string) error {
 		return err
 	}
 
+	// Said at startup rather than discovered on day thirty. An agent with no
+	// control-plane address cannot renew, and the failure mode of not knowing
+	// that is a fleet that stops connecting with no symptom anyone can attribute.
+	switch {
+	case *controlAdr == "":
+		log.Warn("no control-plane address; this certificate will not be renewed",
+			"expires_at", id.NotAfter.UTC().Format(time.RFC3339),
+			"hint", "pass -control-addr to renew unattended")
+	case id.DueForRenewal(time.Now()):
+		log.Info("certificate is due for renewal and will be replaced on start",
+			"expires_at", id.NotAfter.UTC().Format(time.RFC3339))
+	}
+
 	a, err := agent.New(agent.Config{
-		RelayAddr:     *relayAddr,
-		Identity:      id,
-		Resources:     allowlist,
-		MaxStreams:    uint32(*maxStreams),
-		RetryInterval: *retry,
-		Logger:        log,
+		RelayAddr:        *relayAddr,
+		Identity:         id,
+		Resources:        allowlist,
+		MaxStreams:       uint32(*maxStreams),
+		RetryInterval:    *retry,
+		MaxRetryInterval: *maxRetry,
+		ControlAddr:      *controlAdr,
+		StateDir:         *stateDir,
+		Logger:           log,
 	})
 	if err != nil {
 		return err

@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -215,4 +216,88 @@ func (s *Store) CountAudit(ctx context.Context) (int64, error) {
 	var n int64
 	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM audit_events`).Scan(&n)
 	return n, err
+}
+
+// ErrRetentionUnbounded means a prune was attempted with no cutoff.
+var ErrRetentionUnbounded = errors.New("storage: refusing to prune the audit trail without a cutoff")
+
+// PruneAudit removes events older than a cutoff and records that it did.
+//
+// # Why this exists at all, given the trail is append-only
+//
+// Invariant 11 says the software never modifies a recorded event. This is the
+// single, deliberate exception, and it is narrow on purpose:
+//
+//   - It is never automatic. Nothing calls it on a timer. An administrator
+//     invokes it, with an explicit cutoff, having decided what the retention
+//     period is.
+//   - It removes whole events older than a date. It cannot edit one, cannot
+//     remove one by subject, and cannot be pointed at a particular incident.
+//   - It records its own execution, in the same transaction, with the cutoff and
+//     the number of rows removed. That record is itself un-prunable in practice,
+//     because it is written with the current timestamp and every cutoff is in the
+//     past.
+//
+// The alternative was considered and rejected: a trail that grows without bound
+// fills the disk, and a control plane that has run out of disk cannot write the
+// audit event for the decision it is about to make — so under invariant 11 it
+// must refuse the decision. Unbounded growth is therefore not "safe by default",
+// it is a slow denial of service on the system's own authorization path.
+//
+// What is *not* solved here is anyone with filesystem access editing the
+// database directly. That needs a hash chain or an external sink, and neither is
+// built; the threat model says so plainly.
+func (s *Store) PruneAudit(ctx context.Context, before time.Time, actorID string) (removed int64, err error) {
+	if before.IsZero() {
+		return 0, ErrRetentionUnbounded
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	res, err := tx.ExecContext(ctx, `DELETE FROM audit_events WHERE ts < ?`, unix(before))
+	if err != nil {
+		return 0, fmt.Errorf("storage: prune audit: %w", err)
+	}
+	removed, err = res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+
+	// Written even when nothing matched. "We ran retention and it removed
+	// nothing" is a different fact from "retention was never run", and an audit
+	// trail that cannot distinguish them is missing the more interesting one.
+	if err := AppendAuditTx(ctx, tx, AuditEvent{
+		Event:     "admin.action",
+		ActorRole: "admin",
+		ActorID:   actorID,
+		Reason:    "audit_retention",
+		Detail: fmt.Sprintf("pruned %d event(s) older than %s",
+			removed, before.UTC().Format(time.RFC3339)),
+	}); err != nil {
+		return 0, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return removed, nil
+}
+
+// AuditSpan reports how many events the trail holds and how far back it reaches,
+// so an administrator can see growth before it becomes a disk problem.
+func (s *Store) AuditSpan(ctx context.Context) (count int64, oldest time.Time, err error) {
+	var ts sql.NullInt64
+	err = s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*), MIN(ts) FROM audit_events`).Scan(&count, &ts)
+	if err != nil {
+		return 0, time.Time{}, err
+	}
+	if ts.Valid {
+		oldest = fromUnix(ts.Int64)
+	}
+	return count, oldest, nil
 }

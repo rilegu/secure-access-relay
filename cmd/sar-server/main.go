@@ -153,6 +153,12 @@ func (d *deployment) close() {
 // The authority is generated once and then reused. Regenerating it would
 // invalidate every certificate already issued, so its absence means first run and
 // its presence is authoritative.
+// certTTL is the certificate lifetime this process issues, overridable with the
+// -cert-ttl flag on run. A package variable rather than a parameter threaded
+// through every command, because every command that opens a deployment needs the
+// same value and only one of them has a flag to set it.
+var certTTL = enrollment.DefaultCertTTL
+
 func openDeployment(stateDir string) (*deployment, error) {
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create state directory: %w", err)
@@ -228,7 +234,7 @@ func openDeployment(stateDir string) (*deployment, error) {
 	return &deployment{
 		authority: authority,
 		store:     store,
-		enroll:    enrollment.New(store, authority, issuer.PublicKey()),
+		enroll:    enrollment.New(store, authority, issuer.PublicKey()).WithCertTTL(certTTL),
 		issuer:    issuer,
 		login:     login.New(store, login.DefaultTTL),
 		audit:     audit.NewRecorder(store, logging.New("info")),
@@ -315,11 +321,13 @@ func cmdRun(args []string) error {
 		stateDir    = fs.String("state-dir", "state", "directory holding the authority and enrollment store")
 		tlsNames    = fs.String("tls-names", "localhost,127.0.0.1,::1", "comma-separated names and IPs the server certificate is valid for")
 		maxStreams  = fs.Uint("max-streams", 16, "maximum concurrent streams per session")
+		certLife    = fs.Duration("cert-ttl", enrollment.DefaultCertTTL, "lifetime of issued certificates; peers renew unattended before it elapses")
 		logLevel    = fs.String("log-level", "info", "log level: debug, info, warn, error")
 	)
 	_ = fs.Parse(args)
 
 	log := logging.New(*logLevel)
+	certTTL = *certLife
 
 	dep, err := openDeployment(*stateDir)
 	if err != nil {
@@ -595,7 +603,16 @@ func cmdList(args []string) error {
 			if r.Revoked {
 				status = "REVOKED"
 			}
-			fmt.Printf("  %-24s %-8s enrolled %s\n", r.ID, status, r.EnrolledAt.UTC().Format(time.RFC3339))
+			// A pending renewal is worth showing. It means a certificate was
+			// issued and the endpoint has not come back with it yet: either a
+			// renewal in flight, or an endpoint that failed to store what it was
+			// given and is still running on the certificate it had.
+			pending := ""
+			if r.PendingSerialHex != "" {
+				pending = "  renewal issued, not yet collected"
+			}
+			fmt.Printf("  %-24s %-8s enrolled %s%s\n",
+				r.ID, status, r.EnrolledAt.UTC().Format(time.RFC3339), pending)
 		}
 	}
 	return nil

@@ -183,6 +183,16 @@ func (s *Service) Enroll(token string, csrPEM []byte) (*Result, error) {
 // revoked, or the certificate may have been superseded by a re-enrollment. TLS
 // proves the chain; this proves the identity is still one the control plane
 // recognises.
+//
+// # Renewal
+//
+// An identity with an outstanding renewal has two acceptable serials: the one it
+// is using and the one it has been offered. Presenting the new one is the signal
+// that the endpoint received and stored it, so the new serial is promoted here
+// and the old one stops being accepted from that moment.
+//
+// Promotion happens on use rather than at issue because the alternative bricks
+// endpoints. See migration 2 in internal/storage and ADR-0016.
 func (s *Service) VerifyEnrolled(cert *x509.Certificate) (ca.Identity, error) {
 	id, err := ca.IdentityOf(cert)
 	if err != nil {
@@ -194,13 +204,95 @@ func (s *Service) VerifyEnrolled(cert *x509.Certificate) (ca.Identity, error) {
 		return ca.Identity{}, err
 	}
 
-	if rec.SerialHex != cert.SerialNumber.Text(16) {
+	presented := cert.SerialNumber.Text(16)
+	switch {
+	case rec.SerialHex == presented:
+		return id, nil
+
+	case rec.PendingSerialHex != "" && rec.PendingSerialHex == presented:
+		// First use of a renewed certificate. Promote it, which retires the
+		// previous serial immediately: from here the endpoint has demonstrably
+		// got the new one, so continuing to accept the old one would leave two
+		// usable certificates for one identity.
+		if err := s.store.PromoteSerial(string(id.Role), id.ID, presented); err != nil {
+			return ca.Identity{}, err
+		}
+		return id, nil
+
+	default:
 		// Signed by us, for this identity, but superseded. Accepting it would
 		// mean a re-enrolled device could still be impersonated with its old
 		// certificate.
 		return ca.Identity{}, fmt.Errorf("%w: certificate superseded by a later enrollment", storage.ErrNotEnrolled)
 	}
-	return id, nil
+}
+
+// Renew issues a fresh certificate to an identity that already holds a valid one.
+//
+// # Why this is not re-enrollment
+//
+// Re-enrollment needs a token, which needs a human to mint and deliver one. A
+// fleet whose certificates expire after thirty days cannot depend on that: the
+// failure mode is every endpoint going dark on the same day, silently, with no
+// symptom but agents that stop connecting. Renewal is authenticated by the
+// certificate being replaced, so it needs nobody.
+//
+// The presented certificate is verified exactly as any other connection's would
+// be, so a revoked identity cannot renew its way back and a superseded
+// certificate cannot be used to mint a current one.
+func (s *Service) Renew(cert *x509.Certificate, csrPEM []byte) (*Result, error) {
+	id, err := s.VerifyEnrolled(cert)
+	if err != nil {
+		return nil, err
+	}
+
+	csr, err := parseCSR(csrPEM)
+	if err != nil {
+		return nil, err
+	}
+
+	// The identity comes from the verified certificate, never from the request.
+	// A renewal that took its identity from the CSR would let any enrolled peer
+	// mint a certificate for any other.
+	certPEM, err := s.ca.Sign(csr, id, s.certTTL)
+	if err != nil {
+		return nil, err
+	}
+	issued, err := parseCert(certPEM)
+	if err != nil {
+		return nil, err
+	}
+
+	// Recorded as pending, not current. The endpoint's own next connection is
+	// what makes it current.
+	if err := s.store.PutPendingSerial(string(id.Role), id.ID, issued.SerialNumber.Text(16)); err != nil {
+		return nil, err
+	}
+
+	return &Result{
+		CertificatePEM: certPEM,
+		CAPEM:          s.ca.CertPEM(),
+		Identity:       id,
+		NotAfter:       issued.NotAfter,
+		GrantPublicKey: s.grantPub,
+	}, nil
+}
+
+// CertTTL reports the lifetime of certificates this service issues, so a peer
+// can decide when renewal is due without guessing.
+func (s *Service) CertTTL() time.Duration { return s.certTTL }
+
+// WithCertTTL overrides the certificate lifetime.
+//
+// Exists so a deployment can choose a shorter one, and so renewal can be
+// exercised without waiting twenty days. A lifetime shorter than the renewal
+// window means peers renew on essentially every check, which is wasteful but not
+// wrong — and is exactly what makes it demonstrable.
+func (s *Service) WithCertTTL(ttl time.Duration) *Service {
+	if ttl > 0 {
+		s.certTTL = ttl
+	}
+	return s
 }
 
 func parseCSR(csrPEM []byte) (*x509.CertificateRequest, error) {
