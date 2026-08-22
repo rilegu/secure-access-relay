@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/rilegu/secure-access-relay/internal/backoff"
 	"github.com/rilegu/secure-access-relay/internal/bridge"
 	"github.com/rilegu/secure-access-relay/internal/identity"
 	"github.com/rilegu/secure-access-relay/internal/mux"
@@ -93,6 +94,19 @@ type Forwarder struct {
 	sessMu sync.Mutex
 	sess   *mux.Session
 
+	// retry paces redialling while the relay is unreachable, and notBefore is
+	// when the next attempt is allowed.
+	//
+	// Without this, every local connection triggers its own dial: a browser
+	// opening six parallel requests against a down relay produces six
+	// handshake attempts and six near-identical errors, repeated for as long as
+	// the page keeps retrying. The gate turns that into one attempt per
+	// interval, and the error the others receive is the real one rather than a
+	// second symptom.
+	retry     *backoff.State
+	notBefore time.Time
+	lastErr   error
+
 	// grants holds the current authorization, refreshed as it ages.
 	grants grantCache
 }
@@ -123,7 +137,12 @@ func New(cfg Config) (*Forwarder, error) {
 	if err := validateListenAddr(cfg.ListenAddr); err != nil {
 		return nil, err
 	}
-	return &Forwarder{cfg: cfg, log: cfg.Logger, ready: make(chan struct{})}, nil
+	return &Forwarder{
+		cfg:   cfg,
+		log:   cfg.Logger,
+		ready: make(chan struct{}),
+		retry: backoff.New(backoff.Policy{}),
+	}, nil
 }
 
 // validateListenAddr requires a literal loopback host and an explicit port.
@@ -225,6 +244,14 @@ func (f *Forwarder) session(ctx context.Context) (*mux.Session, error) {
 		}
 	}
 
+	// Inside the backoff window: report the reason the last attempt failed
+	// rather than producing another identical failure. Every concurrent local
+	// connection would otherwise dial on its own.
+	if now := time.Now(); now.Before(f.notBefore) {
+		return nil, fmt.Errorf("relay unreachable, next attempt in %s: %w",
+			f.notBefore.Sub(now).Round(time.Millisecond), f.lastErr)
+	}
+
 	tlsCfg := transport.ClientTLS(
 		f.cfg.Identity.Certificate,
 		f.cfg.Identity.CAPool,
@@ -235,7 +262,7 @@ func (f *Forwarder) session(ctx context.Context) (*mux.Session, error) {
 	conn, err := transport.DialTLS(dialCtx, f.cfg.RelayAddr, tlsCfg)
 	cancel()
 	if err != nil {
-		return nil, fmt.Errorf("connect to relay: %w", err)
+		return nil, f.failed(fmt.Errorf("connect to relay: %w", err))
 	}
 
 	sess, err := mux.Dial(ctx, conn, mux.Config{
@@ -250,12 +277,30 @@ func (f *Forwarder) session(ctx context.Context) (*mux.Session, error) {
 	})
 	if err != nil {
 		_ = conn.Close()
-		return nil, fmt.Errorf("relay handshake: %w", err)
+		return nil, f.failed(fmt.Errorf("relay handshake: %w", err))
 	}
 
 	f.log.Info("relay session established", "session_id", sess.ID)
+	f.retry.Reset()
+	f.notBefore = time.Time{}
+	f.lastErr = nil
 	f.sess = sess
 	return sess, nil
+}
+
+// failed records a dial failure and opens the backoff window. The caller holds
+// sessMu.
+func (f *Forwarder) failed(err error) error {
+	delay := f.retry.Next()
+	f.notBefore = time.Now().Add(delay)
+	f.lastErr = err
+	f.log.Warn("relay unreachable",
+		"error", err,
+		"retry_in", delay.Round(time.Millisecond),
+		"retry_within", f.retry.Ceiling(),
+		"attempt", f.retry.Attempt(),
+	)
+	return err
 }
 
 func (f *Forwarder) closeSession() {

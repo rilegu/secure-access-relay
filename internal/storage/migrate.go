@@ -123,6 +123,26 @@ var migrations = []migration{
 			`CREATE INDEX idx_audit_grant ON audit_events(grant_id)`,
 		},
 	},
+	{
+		description: "pending certificate serial, for renewal that cannot brick an endpoint",
+		stmts: []string{
+			// A renewed certificate is recorded here, not in serial_hex, and is
+			// promoted the first time it is actually presented.
+			//
+			// Superseding immediately would mean a peer that failed to persist
+			// the certificate it was just issued — a crash, a full disk, a power
+			// loss in the window between the response and the write — could never
+			// authenticate again and would need re-enrolling by hand. Accepting
+			// either serial until the new one is seen removes that failure mode
+			// without leaving two certificates valid indefinitely.
+			`ALTER TABLE identities ADD COLUMN pending_serial_hex TEXT NOT NULL DEFAULT ''`,
+
+			// When the renewal was issued, for admin output and so an operator can
+			// see that an endpoint has been offered a certificate it has not yet
+			// come back with.
+			`ALTER TABLE identities ADD COLUMN pending_issued_at INTEGER`,
+		},
+	},
 }
 
 // SchemaVersion is the schema this build expects: one per migration, so

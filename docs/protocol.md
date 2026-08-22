@@ -195,6 +195,9 @@ POST   /v1/enroll     single-use token, CSR, returns a certificate. No client
                       certificate required — a peer enrolls precisely because it
                       has none, so the listener verifies one if given and each
                       route decides for itself.
+POST   /v1/renew      any enrolled peer: obtain a fresh certificate, authenticated
+                      by the certificate being replaced. No token, so a fleet
+                      renews unattended.
 POST   /v1/login      operator: open a session. Client certificate required.
 POST   /v1/logout     operator: end their own session and the grants under it.
 POST   /v1/grants     operator: request a grant. Client certificate *and* a live

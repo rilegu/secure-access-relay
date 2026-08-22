@@ -22,6 +22,15 @@ type Record struct {
 
 	Revoked   bool       `json:"revoked"`
 	RevokedAt *time.Time `json:"revoked_at,omitempty"`
+
+	// PendingSerialHex is a renewed certificate that has been issued but not yet
+	// used. Both it and SerialHex are accepted until the new one is presented,
+	// at which point it is promoted and this is cleared. Empty when there is no
+	// renewal outstanding.
+	PendingSerialHex string `json:"pending_serial_hex,omitempty"`
+
+	// PendingIssuedAt is when that renewal was issued.
+	PendingIssuedAt *time.Time `json:"pending_issued_at,omitempty"`
 }
 
 // Token is a single-use enrollment token.
@@ -139,16 +148,69 @@ func (s *Store) ConsumeToken(token string) (Token, error) {
 // the token — and the previous certificate stops being accepted the moment its
 // serial is no longer the current one.
 func (s *Store) PutRecord(r Record) error {
+	// Any outstanding renewal is discarded. A fresh enrollment is a deliberate
+	// act that replaces whatever came before, including a certificate that was
+	// offered and never collected.
 	_, err := s.db.Exec(
-		`INSERT INTO identities (role, id, enrolled_at, serial_hex, revoked_at)
-		 VALUES (?, ?, ?, ?, ?)
+		`INSERT INTO identities
+		     (role, id, enrolled_at, serial_hex, revoked_at, pending_serial_hex, pending_issued_at)
+		 VALUES (?, ?, ?, ?, ?, '', NULL)
 		 ON CONFLICT(role, id) DO UPDATE SET
-		     enrolled_at = excluded.enrolled_at,
-		     serial_hex  = excluded.serial_hex,
-		     revoked_at  = excluded.revoked_at`,
+		     enrolled_at        = excluded.enrolled_at,
+		     serial_hex         = excluded.serial_hex,
+		     revoked_at         = excluded.revoked_at,
+		     pending_serial_hex = '',
+		     pending_issued_at  = NULL`,
 		r.Role, r.ID, unix(r.EnrolledAt), r.SerialHex, nullUnix(r.RevokedAt))
 	if err != nil {
 		return fmt.Errorf("storage: record identity: %w", err)
+	}
+	return nil
+}
+
+// PutPendingSerial records a renewed certificate without superseding the current
+// one.
+//
+// The identity keeps authenticating with the certificate it already holds until
+// it presents the new one. See migration 2 for why the alternative — superseding
+// at issue — turns a failed write on the endpoint into an endpoint that must be
+// re-enrolled by hand.
+func (s *Store) PutPendingSerial(role, id, serialHex string) error {
+	res, err := s.db.Exec(
+		`UPDATE identities SET pending_serial_hex = ?, pending_issued_at = ?
+		  WHERE role = ? AND id = ? AND revoked_at IS NULL`,
+		serialHex, unix(time.Now()), role, id)
+	if err != nil {
+		return fmt.Errorf("storage: record pending certificate: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		// Either it does not exist or it is revoked. Both mean no renewal.
+		if _, lerr := s.lookupAny(role, id); lerr != nil {
+			return lerr
+		}
+		return ErrRevoked
+	}
+	return nil
+}
+
+// PromoteSerial makes a pending certificate the current one.
+//
+// Called the first time the renewed certificate is presented, which is the
+// signal that the endpoint has it and has stored it. The condition is in the
+// UPDATE so two concurrent connections presenting the same new certificate
+// cannot both promote and then disagree about what happened.
+func (s *Store) PromoteSerial(role, id, serialHex string) error {
+	_, err := s.db.Exec(
+		`UPDATE identities
+		    SET serial_hex = pending_serial_hex, pending_serial_hex = '', pending_issued_at = NULL
+		  WHERE role = ? AND id = ? AND pending_serial_hex = ? AND revoked_at IS NULL`,
+		role, id, serialHex)
+	if err != nil {
+		return fmt.Errorf("storage: promote certificate: %w", err)
 	}
 	return nil
 }
@@ -173,11 +235,11 @@ func (s *Store) Lookup(role, id string) (Record, error) {
 func (s *Store) lookupAny(role, id string) (Record, error) {
 	var r Record
 	var enrolled int64
-	var revoked sql.NullInt64
+	var revoked, pendingAt sql.NullInt64
 	err := s.db.QueryRow(
-		`SELECT role, id, enrolled_at, serial_hex, revoked_at
+		`SELECT role, id, enrolled_at, serial_hex, revoked_at, pending_serial_hex, pending_issued_at
 		   FROM identities WHERE role = ? AND id = ?`, role, id).
-		Scan(&r.Role, &r.ID, &enrolled, &r.SerialHex, &revoked)
+		Scan(&r.Role, &r.ID, &enrolled, &r.SerialHex, &revoked, &r.PendingSerialHex, &pendingAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Record{}, ErrNotEnrolled
 	}
@@ -187,6 +249,7 @@ func (s *Store) lookupAny(role, id string) (Record, error) {
 	r.EnrolledAt = fromUnix(enrolled)
 	r.RevokedAt = fromNullUnix(revoked)
 	r.Revoked = r.RevokedAt != nil
+	r.PendingIssuedAt = fromNullUnix(pendingAt)
 	return r, nil
 }
 
@@ -221,7 +284,7 @@ func (s *Store) Revoke(role, id string) error {
 // List returns every record for a role, revoked ones included, for admin output.
 func (s *Store) List(role string) []Record {
 	rows, err := s.db.Query(
-		`SELECT role, id, enrolled_at, serial_hex, revoked_at
+		`SELECT role, id, enrolled_at, serial_hex, revoked_at, pending_serial_hex, pending_issued_at
 		   FROM identities WHERE role = ? ORDER BY id`, role)
 	if err != nil {
 		return nil
@@ -232,13 +295,15 @@ func (s *Store) List(role string) []Record {
 	for rows.Next() {
 		var r Record
 		var enrolled int64
-		var revoked sql.NullInt64
-		if err := rows.Scan(&r.Role, &r.ID, &enrolled, &r.SerialHex, &revoked); err != nil {
+		var revoked, pendingAt sql.NullInt64
+		if err := rows.Scan(&r.Role, &r.ID, &enrolled, &r.SerialHex, &revoked,
+			&r.PendingSerialHex, &pendingAt); err != nil {
 			return out
 		}
 		r.EnrolledAt = fromUnix(enrolled)
 		r.RevokedAt = fromNullUnix(revoked)
 		r.Revoked = r.RevokedAt != nil
+		r.PendingIssuedAt = fromNullUnix(pendingAt)
 		out = append(out, r)
 	}
 	return out

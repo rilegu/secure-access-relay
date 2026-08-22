@@ -208,6 +208,30 @@ session, and no additional secret is required. What it buys is a lever shorter t
 so an operator's activity during one incident is a single query rather than a
 reconstruction from timestamps. It is also the seam an identity provider plugs into later.
 
+**Reconnect backs off, with jitter, and listens for the network coming back.**
+A fixed retry interval is fine for one client and pathological for a fleet: a
+relay restart is met by every endpoint at the same instant, forever, and the
+restart becomes an outage. Delays grow exponentially and are drawn uniformly from
+the whole interval — a narrow band around a shared value is still a shared value.
+Separately, an address appearing cuts the wait short, because backoff answers
+"how hard should I retry" and a network change answers "the reason it was failing
+may have just gone away". The two are different questions and both are needed.
+
+**Certificates renew themselves, and a failed renewal cannot brick an endpoint.**
+Certificates last thirty days; without renewal a fleet goes dark in the same week
+it was enrolled, silently. Renewal is authenticated by the certificate being
+replaced, so it needs no token and no human. The subtle part is that a renewed
+certificate is recorded as *pending* and only becomes current the first time it
+is actually presented — so a crash, a full disk, or a power cut between issuing
+and storing it leaves the endpoint still able to authenticate with what it had.
+Superseding at issue, the obvious implementation, has a small window with an
+unrecoverable consequence, which is the worst combination
+([ADR-0016](docs/decisions/0016-renewal-is-pending-until-used.md)).
+
+Certificate lifetime is `sar-server run -cert-ttl` and defaults to thirty days;
+peers renew at ten days remaining. Setting it to a couple of minutes is how the
+whole cycle is exercised without waiting three weeks.
+
 **Every decision is written to a queryable audit trail.** Who connected, what they were
 granted and under which policy, every stream opened and refused with its reason code, and
 every finished stream's byte counts and duration. A grant and the record of that grant
@@ -292,10 +316,13 @@ encryption: the relay terminates TLS on both sides and sees plaintext.
 | Grant revocation before expiry, including live streams | working |
 | Cascading revocation: identity to sessions to grants to streams | working |
 | SQLite control-plane state with numbered migrations | working |
+| Exponential reconnect backoff with full jitter | working |
+| Network-change detection (native on Windows, polled elsewhere) | working |
+| Unattended certificate renewal | working |
+| Audit retention, explicit and self-recording | working |
 | End-to-end encryption between operator and agent | not implemented |
 | Tamper-evident or externally shipped audit | not implemented |
 | Single sign-on for operators | not implemented |
-| Automatic certificate renewal | not implemented |
 | WFP leak guard | not implemented |
 | Native diagnostics library | not implemented |
 
@@ -338,8 +365,13 @@ Beyond the unimplemented work above, these hold by design:
 - **The control plane is a single node.** SQLite means one writer and one machine. There
   is no replication and no failover; a lost database is a lost deployment unless it was
   backed up.
-- **Certificates expire after thirty days and are not renewed automatically.**
-  Re-enrolling is a manual step.
+- **An endpoint offline for most of a month needs re-enrolling by hand.**
+  Certificates renew themselves unattended, but renewal is authenticated by
+  presenting the certificate being replaced — so one that has already expired
+  cannot renew. The window is ten days of a thirty-day life.
+- **The audit trail grows until somebody prunes it.** Retention exists but is
+  never automatic, because software that silently deletes its own evidence is
+  worse than software that fills a disk. `sar-server audit -stats` shows the size.
 - **Whoever hands over an enrollment code is trusted.** The code is single-use,
   short-lived, and carries the authority fingerprint so the peer can verify the server it
   enrolls with — but the channel that delivers it is outside the system. That is
@@ -388,6 +420,14 @@ about fifteen entry points called with `syscall`, each visible with its structur
 and error handling. It also rehearses the dynamic-loading technique the native diagnostics
 library will use. The same applies to the service control manager and the Event Log
 ([ADR-0012](docs/decisions/0012-win32-through-stdlib.md)).
+
+**Reconnection uses full jitter**, not a fixed interval and not a narrow band
+around one. A thousand endpoints jittering ten percent around thirty seconds all
+arrive inside a six-second window; drawing uniformly from the whole interval is
+what actually decorrelates them. On Windows the reconnect loop also waits on
+`NotifyAddrChange` and `NotifyRouteChange` through `syscall`, so a returning link
+is noticed immediately rather than at the end of a grown delay; elsewhere it
+polls the interface list.
 
 **Control-plane state is SQLite**, with numbered migrations and an explicit refusal to
 start against a schema newer than the binary understands. Every statement is
@@ -442,8 +482,10 @@ make build
 # A local service to expose. Binds strictly to loopback.
 go run ./testdata/fixtures/httpfixture.go -addr 127.0.0.1:8080
 
-# The endpoint agent. Dials out; never listens.
-./bin/sar-agent run -resources resources.json
+# The endpoint agent. Dials out; never listens. The control-plane address is
+# what lets it renew its own certificate before the thirty days are up; without
+# it the agent works until the certificate lapses and then goes quiet.
+./bin/sar-agent run -resources resources.json -control-addr 127.0.0.1:17071
 
 # Open an operator session. The certificate authenticates it; the session is what
 # makes the work that follows revocable as a group and attributable in the audit
@@ -550,8 +592,13 @@ are revoked immediately:
 On the protected machine, from an elevated prompt:
 
 ```powershell
-.\installer\install.ps1 -EnrollmentCode sar1... -RelayAddr relay.example:443 -Target 127.0.0.1:8080
+.\installer\install.ps1 -EnrollmentCode sar1... -RelayAddr relay.example:443 `
+                        -ControlAddr relay.example:17071 -Target 127.0.0.1:8080
 ```
+
+`-ControlAddr` is what lets the service renew unattended. Leave it out and the
+installer warns: the agent will run correctly until its certificate expires and
+then stop connecting, which is the failure hardest to attribute after the fact.
 
 That copies the agent to Program Files, creates an ACL-protected state directory under
 ProgramData that Users cannot read, enrolls the device, and registers the service with

@@ -63,10 +63,11 @@ func requireWindows(f func() error) error {
 func cmdServiceInstall(args []string) error {
 	fs := flag.NewFlagSet("service install", flag.ExitOnError)
 	var (
-		relayAddr = fs.String("relay-addr", "127.0.0.1:17070", "relay address the service connects out to")
-		stateDir  = fs.String("state-dir", "", "directory holding the key and certificate (default: alongside the executable)")
-		target    = fs.String("target", "127.0.0.1:8080", "local service to expose; must be a loopback literal")
-		logLevel  = fs.String("log-level", "info", "log level the service runs with")
+		relayAddr  = fs.String("relay-addr", "127.0.0.1:17070", "relay address the service connects out to")
+		controlAdr = fs.String("control-addr", "", "control-plane address, so the service renews its own certificate")
+		stateDir   = fs.String("state-dir", "", "directory holding the key and certificate (default: alongside the executable)")
+		target     = fs.String("target", "127.0.0.1:8080", "local service to expose; must be a loopback literal")
+		logLevel   = fs.String("log-level", "info", "log level the service runs with")
 	)
 	_ = fs.Parse(args)
 
@@ -96,18 +97,33 @@ func cmdServiceInstall(args []string) error {
 		return err
 	}
 
+	// The arguments are baked into the service registration, so anything omitted
+	// here cannot be supplied later without reinstalling. That makes the missing
+	// control-plane address worth warning about rather than defaulting: without
+	// it the service runs correctly and then stops connecting on the day its
+	// certificate expires, with no symptom that points at the cause.
+	runArgs := []string{
+		"run",
+		"-relay-addr", *relayAddr,
+		"-state-dir", dir,
+		"-target", *target,
+		"-log-level", *logLevel,
+	}
+	if *controlAdr != "" {
+		runArgs = append(runArgs, "-control-addr", *controlAdr)
+	} else {
+		fmt.Fprintln(os.Stderr,
+			"warning: no -control-addr given, so this service cannot renew its certificate.")
+		fmt.Fprintln(os.Stderr,
+			"         It will stop connecting when the certificate expires and will need re-enrolling.")
+	}
+
 	err = winsvc.Install(winsvc.Config{
-		Name:        serviceName,
-		DisplayName: serviceDisplayName,
-		Description: serviceDescription,
-		ExePath:     exe,
-		Args: []string{
-			"run",
-			"-relay-addr", *relayAddr,
-			"-state-dir", dir,
-			"-target", *target,
-			"-log-level", *logLevel,
-		},
+		Name:             serviceName,
+		DisplayName:      serviceDisplayName,
+		Description:      serviceDescription,
+		ExePath:          exe,
+		Args:             runArgs,
 		DelayedAutoStart: true,
 		RestartOnFailure: true,
 	})

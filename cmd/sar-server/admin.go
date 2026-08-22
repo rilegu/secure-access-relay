@@ -33,6 +33,9 @@ func cmdAudit(args []string) error {
 		limit    = fs.Int("limit", storage.DefaultAuditLimit, "maximum events to show")
 		denials  = fs.Bool("denials", false, "show only refusals: denied grants, denied streams, refused enrollments")
 		names    = fs.Bool("events", false, "list the event names the trail can contain, and exit")
+		stats    = fs.Bool("stats", false, "report how many events the trail holds and how far back it reaches")
+		pruneAge = fs.Duration("prune-older-than", 0, "remove events older than this age; requires -confirm")
+		confirm  = fs.Bool("confirm", false, "actually perform a prune")
 	)
 	_ = fs.Parse(args)
 
@@ -48,6 +51,14 @@ func cmdAudit(args []string) error {
 	defer dep.close()
 
 	ctx := context.Background()
+
+	if *stats {
+		return auditStats(ctx, dep)
+	}
+	if *pruneAge > 0 {
+		return auditPrune(ctx, dep, *pruneAge, *confirm)
+	}
+
 	filter := storage.AuditFilter{
 		Since:      time.Now().Add(-*since),
 		Event:      *event,
@@ -371,4 +382,82 @@ func sortBySeqDesc(events []storage.AuditEvent) {
 			events[j], events[j-1] = events[j-1], events[j]
 		}
 	}
+}
+
+// auditStats reports the size and reach of the trail.
+//
+// Growth is worth being able to see before it becomes a disk problem: a control
+// plane that has run out of disk cannot write the audit event for the decision
+// it is about to make, and under invariant 11 that means it must refuse the
+// decision. Unbounded growth is a slow denial of service on the authorization
+// path, not a safe default.
+func auditStats(ctx context.Context, dep *deployment) error {
+	count, oldest, err := dep.store.AuditSpan(ctx)
+	if err != nil {
+		return err
+	}
+	if count == 0 {
+		fmt.Println("the audit trail is empty")
+		return nil
+	}
+	fmt.Printf("events:  %d\n", count)
+	fmt.Printf("oldest:  %s (%s ago)\n",
+		oldest.Local().Format(time.RFC3339),
+		time.Since(oldest).Round(time.Hour))
+	fmt.Printf("database: %s\n", dep.store.Path())
+	return nil
+}
+
+// auditPrune removes events older than an age, once an administrator has said so
+// explicitly.
+//
+// Two gates, deliberately. The age must be given — there is no default retention
+// period, because choosing one on an administrator's behalf is choosing how much
+// evidence they keep. And -confirm must be passed, because the first invocation
+// of a destructive command is usually someone finding out what it does.
+func auditPrune(ctx context.Context, dep *deployment, age time.Duration, confirm bool) error {
+	cutoff := time.Now().Add(-age)
+
+	count, oldest, err := dep.store.AuditSpan(ctx)
+	if err != nil {
+		return err
+	}
+	if count == 0 {
+		fmt.Println("the audit trail is empty; nothing to prune")
+		return nil
+	}
+
+	if !confirm {
+		// A dry run reports the damage before doing any. Counting is a separate
+		// query from deleting, so this number can be stale by the time a real
+		// prune runs - which is why it is described as an estimate rather than
+		// printed as though it were the outcome.
+		doomed, err := dep.store.QueryAudit(ctx, storage.AuditFilter{
+			Until: cutoff,
+			Limit: storage.MaxAuditLimit,
+		})
+		if err != nil {
+			return err
+		}
+		fmt.Printf("would remove roughly %d of %d event(s) older than %s\n",
+			len(doomed), count, cutoff.Local().Format(time.RFC3339))
+		fmt.Printf("the trail currently reaches back to %s\n", oldest.Local().Format(time.RFC3339))
+		if len(doomed) == storage.MaxAuditLimit {
+			fmt.Printf("(the estimate is capped at %d; the real number may be larger)\n",
+				storage.MaxAuditLimit)
+		}
+		fmt.Fprintln(os.Stderr, "nothing was removed; pass -confirm to proceed")
+		return nil
+	}
+
+	removed, err := dep.store.PruneAudit(ctx, cutoff, "admin")
+	if err != nil {
+		return err
+	}
+	fmt.Printf("removed %d event(s) older than %s\n",
+		removed, cutoff.Local().Format(time.RFC3339))
+	// The prune itself is in the trail. That record is what stops a gap in the
+	// history looking like a period when nothing happened.
+	fmt.Println("the prune is recorded in the trail as admin.action")
+	return nil
 }

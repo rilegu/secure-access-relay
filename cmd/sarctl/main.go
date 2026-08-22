@@ -28,6 +28,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -157,6 +158,7 @@ func cmdConnect(args []string) error {
 		}
 		return err
 	}
+	id = renewIfDue(context.Background(), log, id, *controlAddr, *stateDir)
 
 	// A session is opened if there is not already a usable one. Automatic
 	// because a session is not a second factor: requiring an explicit login
@@ -226,6 +228,8 @@ func cmdLogin(args []string) error {
 		}
 		return err
 	}
+
+	id = renewIfDue(context.Background(), log, id, *controlAddr, *stateDir)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -298,4 +302,43 @@ func cmdLogout(args []string) error {
 	log.Info("session ended", "session_id", sess.SessionID, "grants_revoked", revoked)
 	fmt.Printf("session %s ended; %d grant(s) revoked\n", sess.SessionID, revoked)
 	return nil
+}
+
+// renewIfDue replaces the operator's certificate when it is close to expiry.
+//
+// Done here rather than by a background service because sarctl is not one: it
+// runs when an operator runs it. Checking on each command means a certificate is
+// refreshed by ordinary use, and an operator who works at least once every
+// twenty days never sees an expiry.
+//
+// A failure is reported and ignored. "Due" means the current certificate is
+// still valid, so the command can proceed; refusing to work because a renewal
+// that was not needed yet did not happen would be the wrong trade during an
+// incident.
+func renewIfDue(ctx context.Context, log *slog.Logger, id *identity.Identity, controlAddr, stateDir string) *identity.Identity {
+	if id.Expired(time.Now()) {
+		log.Warn("certificate has expired; re-enroll with a new code",
+			"expired_at", id.NotAfter.UTC().Format(time.RFC3339))
+		return id
+	}
+	if !id.DueForRenewal(time.Now()) {
+		return id
+	}
+
+	renewCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+
+	renewed, ok, err := identity.RenewIfDue(renewCtx, id, controlAddr, stateDir)
+	if err != nil {
+		log.Warn("certificate renewal failed; continuing with the current one",
+			"error", err,
+			"expires_at", id.NotAfter.UTC().Format(time.RFC3339))
+		return id
+	}
+	if ok {
+		log.Info("certificate renewed",
+			"identity", renewed.ID.String(),
+			"expires_at", renewed.NotAfter.UTC().Format(time.RFC3339))
+	}
+	return renewed
 }

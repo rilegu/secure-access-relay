@@ -6,11 +6,14 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"sync/atomic"
 	"time"
 
+	"github.com/rilegu/secure-access-relay/internal/backoff"
 	"github.com/rilegu/secure-access-relay/internal/bridge"
 	"github.com/rilegu/secure-access-relay/internal/identity"
 	"github.com/rilegu/secure-access-relay/internal/mux"
+	"github.com/rilegu/secure-access-relay/internal/netwatch"
 	"github.com/rilegu/secure-access-relay/internal/proto"
 	"github.com/rilegu/secure-access-relay/internal/transport"
 )
@@ -38,8 +41,30 @@ type Config struct {
 	// MaxStreams caps concurrent streams the relay may open on this agent.
 	MaxStreams uint32
 
-	// RetryInterval is how long to wait before redialling the relay.
+	// RetryInterval is the ceiling on the *first* redial delay. Subsequent
+	// failures grow it exponentially up to MaxRetryInterval, with full jitter —
+	// see internal/backoff for why a fixed interval is wrong for a fleet.
 	RetryInterval time.Duration
+
+	// MaxRetryInterval bounds the grown delay. Zero uses the backoff default.
+	MaxRetryInterval time.Duration
+
+	// ControlAddr is the control plane, used only to renew this endpoint's
+	// certificate before it expires.
+	//
+	// Optional. Without it the agent still runs and still forwards traffic, and
+	// says at startup that it will go dark when its certificate expires — which
+	// is better than a fleet that silently stops connecting on day thirty with
+	// no symptom anyone can attribute.
+	ControlAddr string
+
+	// StateDir is where the renewed certificate and key are written. Required
+	// for renewal; ignored without ControlAddr.
+	StateDir string
+
+	// RenewCheckInterval is how often a connected agent reconsiders renewal.
+	// Zero uses the identity package's default.
+	RenewCheckInterval time.Duration
 
 	KeepAlive   time.Duration
 	IdleTimeout time.Duration
@@ -56,7 +81,21 @@ type Config struct {
 type Agent struct {
 	cfg Config
 	log *slog.Logger
+
+	// identity is held atomically because renewal replaces it while a session is
+	// running and while streams are being authorized.
+	//
+	// A plain field would be a data race between the renewal goroutine and every
+	// reader on the hot path — and the reader that matters most is grant
+	// verification, where a torn read would mean checking a signature against
+	// something that is not a key. Swapping a whole immutable value is what keeps
+	// every reader consistent: a stream authorized during a renewal uses either
+	// the old identity or the new one, never a mixture.
+	identity atomic.Pointer[identity.Identity]
 }
+
+// currentIdentity returns the credentials in force right now.
+func (a *Agent) currentIdentity() *identity.Identity { return a.identity.Load() }
 
 // New creates an agent.
 //
@@ -70,7 +109,13 @@ func New(cfg Config) (*Agent, error) {
 		cfg.Logger = slog.Default()
 	}
 	if cfg.RetryInterval <= 0 {
-		cfg.RetryInterval = 2 * time.Second
+		cfg.RetryInterval = backoff.DefaultInitial
+	}
+	if cfg.MaxRetryInterval <= 0 {
+		cfg.MaxRetryInterval = backoff.DefaultMax
+	}
+	if cfg.RenewCheckInterval <= 0 {
+		cfg.RenewCheckInterval = identity.RenewCheckInterval
 	}
 	if cfg.MaxStreams == 0 {
 		cfg.MaxStreams = proto.MaxStreamsPerConnection
@@ -101,7 +146,9 @@ func New(cfg Config) (*Agent, error) {
 		// Refusing to start is the only safe response.
 		return nil, errors.New("agent: no grant verification key; re-enroll to obtain one")
 	}
-	return &Agent{cfg: cfg, log: cfg.Logger}, nil
+	a := &Agent{cfg: cfg, log: cfg.Logger}
+	a.identity.Store(cfg.Identity)
+	return a, nil
 }
 
 // ErrTargetNotLoopback reports a target that is not on the loopback interface.
@@ -140,34 +187,193 @@ func ValidateTarget(addr string) error {
 	return nil
 }
 
+// settleDelay is how long to wait after a network change before redialling.
+//
+// An address appearing does not mean the stack is ready to route through it, and
+// dialling into that gap fails for a reason that has nothing to do with the
+// relay. It also bounds how fast a flapping adapter can drive this loop.
+const settleDelay = 250 * time.Millisecond
+
 // Run maintains the relay session until ctx is cancelled.
 //
 // A dropped session is expected, not exceptional: endpoints move between
 // networks, relays restart, links fail. Run reconnects rather than exiting,
 // because an agent that gives up needs a human to notice, and the point is that
 // nobody has to.
+//
+// # Two different questions
+//
+// Backoff answers "how hard should I retry something that keeps failing".
+// Network-change detection answers "the reason it was failing may have just gone
+// away". Both are needed: without backoff a restarted relay is met by the whole
+// fleet at once, and without change detection an endpoint whose cable was
+// unplugged for a minute sits out a grown delay against a relay that is up.
 func (a *Agent) Run(ctx context.Context) error {
+	retry := backoff.New(backoff.Policy{
+		Initial: a.cfg.RetryInterval,
+		Max:     a.cfg.MaxRetryInterval,
+	})
+
+	// Advisory only. If this never fires — an unsupported platform, a stripped
+	// image — the loop still reconnects on the backoff alone.
+	changes := netwatch.Watch(ctx)
+
 	for {
-		if err := a.session(ctx); err != nil && ctx.Err() == nil {
-			a.log.Warn("relay session ended", "error", err, "retry_in", a.cfg.RetryInterval)
+		// Before dialling, so a certificate that went stale while the agent was
+		// offline is replaced before it is used rather than after it is refused.
+		a.renewIfDue(ctx)
+
+		// The session is cancellable independently of ctx so a renewal completed
+		// mid-session can force a redial with the new certificate. TLS presents
+		// the certificate at handshake time; there is no way to swap it on a
+		// connection that already exists.
+		sessCtx, endSession := context.WithCancel(ctx)
+		go a.watchForRenewal(sessCtx, endSession)
+
+		established, err := a.session(sessCtx)
+		endSession()
+
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		// Reset only after a session that actually existed, never after a
+		// successful dial. A peer that connects and is immediately refused — a
+		// revoked certificate, say — would otherwise reset on every attempt and
+		// hammer the relay forever at the initial interval.
+		if established {
+			retry.Reset()
+		}
+
+		delay := retry.Next()
+		if err != nil {
+			a.log.Warn("relay session ended",
+				"error", err,
+				"retry_in", delay.Round(time.Millisecond),
+				"retry_within", retry.Ceiling(),
+				"attempt", retry.Attempt(),
+			)
 		}
 
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(a.cfg.RetryInterval):
+
+		case <-time.After(delay):
+
+		case <-changes:
+			// The wait is cut short, but the ceiling is deliberately *not* reset.
+			// A flapping adapter would otherwise hold the delay at its minimum
+			// and produce the stampede this exists to prevent.
+			a.log.Info("network changed; redialling early",
+				"retry_within", retry.Ceiling(), "attempt", retry.Attempt())
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(settleDelay):
+			}
+		}
+	}
+}
+
+// renewIfDue replaces the certificate when it is close to expiry.
+//
+// Failure is logged and tolerated. "Due" means the current certificate is still
+// valid, so a control plane that is unreachable today costs nothing but a retry;
+// the ten-day window exists precisely so that outages during it are survivable.
+func (a *Agent) renewIfDue(ctx context.Context) {
+	if a.cfg.ControlAddr == "" || a.cfg.StateDir == "" {
+		return
+	}
+	current := a.currentIdentity()
+	if !current.DueForRenewal(time.Now()) {
+		return
+	}
+
+	renewCtx, cancel := context.WithTimeout(ctx, renewTimeout)
+	defer cancel()
+
+	renewed, ok, err := identity.RenewIfDue(renewCtx, current, a.cfg.ControlAddr, a.cfg.StateDir)
+	if err != nil {
+		a.log.Warn("certificate renewal failed; will retry",
+			"error", err,
+			"expires_at", current.NotAfter.UTC().Format(time.RFC3339),
+			// Rounded to the minute, not the hour: a short-lived certificate would
+			// otherwise report "0s" remaining while it still had minutes left,
+			// which reads as an emergency that is not happening.
+			"expires_in", time.Until(current.NotAfter).Round(time.Minute).String(),
+		)
+		return
+	}
+	if !ok {
+		return
+	}
+
+	a.identity.Store(renewed)
+	a.log.Info("certificate renewed",
+		"identity", renewed.ID.String(),
+		"expires_at", renewed.NotAfter.UTC().Format(time.RFC3339),
+		"key_protection", string(renewed.Protection),
+	)
+}
+
+// renewTimeout bounds one renewal attempt, so a control plane that accepts the
+// connection and then stalls cannot hold a session open indefinitely.
+const renewTimeout = 60 * time.Second
+
+// watchForRenewal renews during a long-lived session and ends it so the next
+// dial uses the new certificate.
+//
+// An agent that holds one session for weeks never returns to the reconnect loop,
+// so renewal driven by reconnection alone would never fire on exactly the
+// endpoints that are working best.
+func (a *Agent) watchForRenewal(ctx context.Context, endSession context.CancelFunc) {
+	if a.cfg.ControlAddr == "" || a.cfg.StateDir == "" {
+		return
+	}
+
+	ticker := time.NewTicker(a.cfg.RenewCheckInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if !a.currentIdentity().DueForRenewal(time.Now()) {
+				continue
+			}
+			before := a.currentIdentity()
+			a.renewIfDue(ctx)
+			if a.currentIdentity() != before {
+				// Ending the session is what makes the new certificate take
+				// effect. The reconnect that follows is immediate, because the
+				// backoff was reset by this session having been established.
+				a.log.Info("ending session to adopt the renewed certificate")
+				endSession()
+				return
+			}
 		}
 	}
 }
 
 // session runs one relay session from dial to disconnect.
-func (a *Agent) session(ctx context.Context) error {
+//
+// It reports whether a session was actually established, which is what the retry
+// loop uses to decide if progress was made. A dial that succeeds and a handshake
+// that is refused are both failures for that purpose.
+func (a *Agent) session(ctx context.Context) (established bool, err error) {
 	// Mutual TLS, verifying the relay against the authority this agent enrolled
 	// with. A relay that cannot present a certificate from that authority is not
 	// the relay this agent belongs to, however reachable it may be.
+	// Read once per session. TLS presents a certificate at handshake time, so a
+	// renewal mid-session cannot affect a connection that already exists — it
+	// takes effect by ending the session and dialling again.
+	id := a.currentIdentity()
+
 	tlsCfg := transport.ClientTLS(
-		a.cfg.Identity.Certificate,
-		a.cfg.Identity.CAPool,
+		id.Certificate,
+		id.CAPool,
 		a.serverName(),
 	)
 
@@ -175,7 +381,7 @@ func (a *Agent) session(ctx context.Context) error {
 	conn, err := transport.DialTLS(dialCtx, a.cfg.RelayAddr, tlsCfg)
 	cancel()
 	if err != nil {
-		return fmt.Errorf("connect to relay: %w", err)
+		return false, fmt.Errorf("connect to relay: %w", err)
 	}
 
 	sess, err := mux.Dial(ctx, conn, mux.Config{
@@ -184,29 +390,30 @@ func (a *Agent) session(ctx context.Context) error {
 		KeepAlive:   a.cfg.KeepAlive,
 		IdleTimeout: a.cfg.IdleTimeout,
 		Logger:      a.log,
-	}, proto.Auth{DeviceID: a.cfg.Identity.ID.ID})
+	}, proto.Auth{DeviceID: id.ID.ID})
 	if err != nil {
 		_ = conn.Close()
-		return fmt.Errorf("relay handshake: %w", err)
+		return false, fmt.Errorf("relay handshake: %w", err)
 	}
 	defer func() { _ = sess.Close(proto.ReasonShutdown) }()
 
 	a.log.Info("connected to relay",
 		"relay_addr", a.cfg.RelayAddr,
 		"session_id", sess.ID,
-		"device_id", a.cfg.Identity.ID.ID,
+		"device_id", id.ID.ID,
 		"resources", a.cfg.Resources.IDs(),
 		"mutual_tls", true,
-		"key_protection", string(a.cfg.Identity.Protection),
+		"key_protection", string(id.Protection),
+		"certificate_expires", id.NotAfter.UTC().Format(time.RFC3339),
 	)
 
 	for {
 		st, err := sess.AcceptStream(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
-				return ctx.Err()
+				return true, ctx.Err()
 			}
-			return sess.Err()
+			return true, sess.Err()
 		}
 		// One goroutine per stream. Concurrency is bounded by the stream limit
 		// negotiated at the handshake, so this cannot grow without limit.
@@ -247,7 +454,10 @@ func (a *Agent) handleStream(ctx context.Context, st *mux.Stream) {
 	// Verify against this agent's own identity. The device identifier is inside
 	// the signature, so a grant captured at another endpoint cannot be replayed
 	// here (threat T6).
-	if err := grant.Verify(a.cfg.Identity.GrantKey, time.Now(), a.cfg.Identity.ID.ID); err != nil {
+	// One snapshot for the whole check, so a renewal landing between the key and
+	// the device identifier cannot verify a grant against a mismatched pair.
+	id := a.currentIdentity()
+	if err := grant.Verify(id.GrantKey, time.Now(), id.ID.ID); err != nil {
 		reason := proto.ReasonForGrant(err)
 		log.Warn("refusing stream: grant rejected",
 			"reason", reason.String(), "grant_id", grant.GrantID, "error", err)
@@ -373,8 +583,8 @@ func smallerLimit(a, b uint64) uint64 {
 // record one, so that a certificate issued for an IP still verifies. It never
 // falls back to skipping verification.
 func (a *Agent) serverName() string {
-	if a.cfg.Identity.ServerName != "" {
-		return a.cfg.Identity.ServerName
+	if sn := a.currentIdentity().ServerName; sn != "" {
+		return sn
 	}
 	host, _, err := net.SplitHostPort(a.cfg.RelayAddr)
 	if err != nil {

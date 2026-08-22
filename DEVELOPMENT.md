@@ -33,9 +33,18 @@ Violating any of these is a bug, not a tradeoff. Enforce them in review.
     clauses from this repository's own string literals and bind every value. Identifiers
     reach the control plane from certificates and request bodies, and a query language is
     the one failure class this project would otherwise not have had at all.
-11. **The audit trail is append-only.** No `UPDATE`, no `DELETE`, ever, on
-    `audit_events`. A decision and the record of that decision commit in one transaction:
+11. **The audit trail is append-only.** The software never modifies a recorded
+    event. A decision and the record of that decision commit in one transaction:
     if the record cannot be written, the access is not granted.
+
+    Exactly one exception, and it is narrow: retention
+    (`sar-server audit -prune-older-than ... -confirm`) removes whole events older
+    than an administrator-supplied cutoff and records its own execution in the
+    same transaction. Never automatic, no default period, cannot select by
+    subject, cannot edit an event. Unbounded growth is not the safe default it
+    looks like - a control plane that cannot write an audit event must refuse the
+    decision it was about to make, so a full disk stops authorization outright.
+    See [ADR-0017](docs/decisions/0017-audit-retention-is-the-one-exception.md).
 
 ## Stable IDs
 
@@ -95,8 +104,18 @@ cmd/{sar-agent,sar-server,sarctl}/   entrypoints only, thin
 internal/
   proto/         frames, codec, handshake encoding, limits, reason codes
   mux/           many streams over one connection: flow control, keepalive
-  bridge/        bidirectional copy with half-close and abort semantics
+  bridge/        bidirectional copy with half-close, abort, and byte budget
   transport/     framed connection, TLS configuration, handshake completion
+  backoff/       exponential retry with full jitter, so a fleet does not stampede
+  netwatch/      reports local network changes; native on Windows, polled elsewhere
+
+Tuning knobs worth knowing, all of which have working defaults:
+
+  sar-agent  run -retry-interval / -max-retry-interval   first and final backoff ceiling
+  sar-agent  run -control-addr                           required for unattended renewal
+  sar-server run -cert-ttl                               certificate lifetime; short
+                                                         values make renewal observable
+  sar-server audit -stats / -prune-older-than / -confirm  trail size and retention
   ca/            development certificate authority: issues and parses identities
   keystore/      private key at rest; DPAPI on Windows, file permissions elsewhere
   identity/      a peer's own key, certificate, and trust anchor; enrollment client

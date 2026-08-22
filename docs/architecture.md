@@ -51,7 +51,7 @@ end-to-end encryption:
 
 | Component | Today |
 | --------- | ----- |
-| `sar-agent` | runs as a Windows service with delayed auto-start and restart-on-failure. Enrolls, holds an outbound mTLS session, verifies every grant itself, resolves resource identifiers against its own allowlist, enforces expiry and byte budgets on running streams, reconnects on failure. |
+| `sar-agent` | runs as a Windows service with delayed auto-start and restart-on-failure. Enrolls, holds an outbound mTLS session, verifies every grant itself, resolves resource identifiers against its own allowlist, enforces expiry and byte budgets on running streams, reconnects with jittered backoff, and renews its own certificate before it expires. |
 | `sar-server` | control plane (authority, enrollment, policy, grants, operator sessions, audit trail in SQLite) **and** relay (one listener for both roles, registry keyed by device, stream joining, revocation enforcement). |
 | `sarctl` | enrolls, opens a session, requests grants under it, and carries many streams over one relay session. |
 | Transport | **TLS 1.3, mutual, on every data-plane connection.** |
@@ -84,6 +84,11 @@ Enforced today:
   [ADR-0015](decisions/0015-revocation-reaches-live-streams.md).
 - **Every decision is recorded.** A grant and its audit event commit in one transaction,
   so there is no state where access exists and nothing accounts for it.
+- **Failures are expected and bounded.** Reconnection backs off exponentially with full
+  jitter so a relay restart is not met by the whole fleet at once, and a local network
+  change shortens the wait without resetting the growth. Certificates renew unattended,
+  and a renewal that fails part way through leaves the endpoint using the certificate it
+  already had — see [ADR-0016](decisions/0016-renewal-is-pending-until-used.md).
 
 The largest remaining gap is **end-to-end encryption**. The relay terminates TLS on both
 sides and therefore sees plaintext; it is trusted for confidentiality today, and never for
@@ -184,7 +189,8 @@ state/
   grant-signing.key     the grant signing key, sealed through the keystore
   policy.json           the rule set, read at startup
   control.db            SQLite: identities, enrollment tokens, operator sessions,
-                        issued grants, and the audit trail
+                        issued grants, and the audit trail. Grows until an
+                        administrator prunes it; nothing prunes automatically.
   control.db-wal        write-ahead log; readers do not block the audit write
 ```
 

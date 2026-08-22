@@ -127,6 +127,7 @@ func New(cfg Config, enroll *enrollment.Service) (*Server, error) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/enroll", s.handleEnroll)
+	mux.HandleFunc("POST /v1/renew", s.handleRenew)
 	mux.HandleFunc("POST /v1/login", s.handleLogin)
 	mux.HandleFunc("POST /v1/logout", s.handleLogout)
 	mux.HandleFunc("POST /v1/grants", s.handleGrant)

@@ -153,6 +153,7 @@ matters finds two of them.
 ```
 device.enrolled       device.revoked        operator.enrolled     operator.revoked
 enroll.denied
+device.renewed        operator.renewed      renew.denied
 device.connected      device.disconnected
 operator.login        operator.login_denied operator.logout       operator.session_revoked
 grant.created         grant.denied          grant.revoked
@@ -161,6 +162,12 @@ admin.action
 ```
 
 `sar-server audit -events` prints this list.
+
+Renewal is recorded separately from enrollment because they are different
+events. An enrollment means somebody minted a token and handed it over; a renewal
+means an endpoint that was already trusted refreshed itself unattended.
+Conflating them would make a fleet that is working correctly look like continuous
+manual provisioning.
 
 Every event carries a monotonic sequence number, a timestamp, and whichever of `org_id`,
 actor role and identifier, `device_id`, `resource_id`, `grant_id`, and `session_id` apply.
@@ -182,6 +189,30 @@ canary string through a forward and fails if it appears in any column of any row
 registered with the control plane. `policy.created` / `policy.deleted` — policy is a file
 read at startup. `grant.expired` — expiry is passive; nothing observes the moment a grant
 lapses, and a row written by a sweep would claim an event that no component acted on.
+
+### Retention
+
+The trail grows without bound and nothing prunes it automatically. That is
+deliberate, and so is the fact that retention exists at all:
+
+```sh
+sar-server audit -stats                              # size and how far back it reaches
+sar-server audit -prune-older-than 90d               # dry run: reports, removes nothing
+sar-server audit -prune-older-than 90d -confirm      # removes, and records that it did
+```
+
+A cutoff is mandatory, `-confirm` is mandatory, and the prune writes an
+`admin.action` event carrying the cutoff and the number of rows removed — so a
+gap in the history is never ambiguous. Nothing selects by actor, device, or
+grant: the operation most useful to somebody covering their tracks is the one
+that does not exist.
+
+The reason retention exists rather than being refused on principle: a control
+plane that cannot write an audit event must refuse the decision it was about to
+make, because the grant and its record commit together. A full disk therefore
+stops authorization outright, which makes unbounded growth a slow denial of
+service rather than a safe default. See
+[ADR-0017](decisions/0017-audit-retention-is-the-one-exception.md).
 
 ### Querying
 
