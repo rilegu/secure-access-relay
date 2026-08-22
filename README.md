@@ -6,9 +6,12 @@ machine — with no inbound firewall rule, no port forward, and no public IP.**
 A VPN puts you *on a network*. `secure-access-relay` grants you *one resource, for a
 bounded time, with an audit record*.
 
-> **Experimental. Not production software.** The data path works; the security layers do
-> not exist yet. See [Status](#status) for exactly what is implemented, and
-> [Limitations](#limitations) for what this does not do even when finished.
+> **Experimental. Not production software.** Every layer described below is
+> implemented and tested — but nobody outside this repository has reviewed the
+> cryptography, the control plane is a single node with no failover, and the
+> privileged Windows paths have never run on a real service manager. Those are
+> the reasons, not an absence of features. See [Status](#status) for what works
+> and [Limitations](#limitations) for what it does not do even when finished.
 
 ---
 
@@ -139,7 +142,7 @@ becomes reachable only through an authorized, time-bounded, recorded session.
 | `sar-agent` | the protected machine | Runs as a Windows service. Enrolls once, then holds an outbound mTLS session. Local resource allowlist, dials only loopback. Never listens. |
 | `sar-server` | a reachable VM you control | Control plane (certificate authority, enrollment, policy, grants, sessions, audit trail) **and** relay (joins authorized streams). |
 | `sarctl` | the operator's laptop | Enrolls once, opens a session, then opens a local loopback listener and carries it through the relay. |
-| `sardiag` | the protected machine | Optional C diagnostics library, dynamically loaded. Not yet written. |
+| `sardiag` | the protected machine | Optional C library: adapter, address, route, DNS, and proxy state behind a stable `extern "C"` ABI. Loaded by absolute path with its signature verified first. The agent runs identically without it. |
 
 The relay can be entirely self-hosted — a DMZ box, a VPS, your own cloud account. No
 third-party service is involved.
@@ -168,9 +171,22 @@ directly. One code path, so console mode is a genuine way to debug the service r
 than a second program with its own bugs.
 
 **Windows APIs are called through the standard library.** DPAPI, the service control
-manager, and the Event Log are reached with `syscall` rather than a third-party binding —
-about fifteen entry points, each visible with its structure layout and error handling.
-See [ADR-0012](docs/decisions/0012-win32-through-stdlib.md).
+manager, the Event Log, network-change notification, and Authenticode verification are
+reached with `syscall` rather than a third-party binding — each entry point visible with
+its structure layout and error handling. See
+[ADR-0012](docs/decisions/0012-win32-through-stdlib.md).
+
+**The one C component cannot corrupt the agent, by construction.** `sardiag` collects
+network diagnostics and is loaded at runtime, not linked — so the binaries stay pure Go
+and `CGO_ENABLED=0`. Its ABI is designed to make the boundary boring: the caller allocates
+every buffer and the library never returns a pointer it owns, so there is no cross-heap
+free to get wrong; no struct crosses the boundary, only integers and UTF-8 JSON, so
+neither side has to agree with the other about packing or alignment; and truncation is
+reported with the required size rather than performed silently. It is loaded by absolute
+path from the ACL-protected install directory with its Authenticode signature verified
+*before* the file is mapped — verifying afterwards would be verifying code that had
+already run. A missing, unsigned, or broken library costs a support bundle and nothing
+else ([ADR-0005](docs/decisions/0005-native-c-dynamically-loaded.md)).
 
 **Loopback-only targets, enforced at startup.** A target must be a literal loopback
 address with an explicit port. Hostnames are rejected outright, so **no DNS lookup is ever
@@ -292,7 +308,7 @@ to Linux, Windows, and ARM from any host.
 
 ## Status
 
-**This is now a resource proxy.** Every connection is mutual TLS, every peer is an
+**This is a working resource proxy.** Every connection is mutual TLS, every peer is an
 enrolled identity proved by certificate, and every stream requires a signed, expiring
 grant that the endpoint agent verifies for itself before it dials anything.
 
@@ -339,7 +355,7 @@ metadata *is* the audit trail.
 | Tamper-evident or externally shipped audit | not implemented |
 | Single sign-on for operators | not implemented |
 | WFP leak guard | not implemented |
-| Native diagnostics library | not implemented |
+| Native diagnostics library, dynamically loaded | working |
 
 One relay serves many endpoints and many operators, but an endpoint is reachable only
 through the relay it connected to. There is no failover between relays; see
@@ -391,6 +407,10 @@ Beyond the unimplemented work above, these hold by design:
 - **The audit trail grows until somebody prunes it.** Retention exists but is
   never automatic, because software that silently deletes its own evidence is
   worse than software that fills a disk. `sar-server audit -stats` shows the size.
+- **The diagnostics library is Windows-only and optional.** Everything else runs on
+  Linux too; `sardiag` reads Windows network APIs that have no counterpart worth
+  emulating. Its absence changes nothing about access, only what `sar-agent diag` can
+  report.
 - **Whoever hands over an enrollment code is trusted.** The code is single-use,
   short-lived, and carries the authority fingerprint so the peer can verify the server it
   enrolls with — but the channel that delivers it is outside the system. That is
@@ -420,10 +440,20 @@ control-plane state and the audit trail; every dependency has to survive the que
 *"why not the standard library?"*, and that one does
 ([ADR-0011](docs/decisions/0011-sqlite-not-key-value.md)).
 
-**A small C library** (`sardiag`, not yet written) will collect Windows adapter, route,
-DNS, and proxy state behind a stable `extern "C"` ABI, loaded dynamically so the agent
-stays pure Go. C rather than C++ because C++ has no stable ABI and would need an
-`extern "C"` wrapper anyway — [ADR-0005](docs/decisions/0005-native-c-dynamically-loaded.md).
+**A small C library**, `sardiag`, collects Windows adapter, address, route, DNS, and
+proxy state behind a stable `extern "C"` ABI. C rather than C++ because C++ has no stable
+ABI across compilers or even compiler versions, so anything crossing the boundary would
+need an `extern "C"` wrapper regardless — writing it in C removes the wrapper instead of
+hiding it. It is loaded at runtime rather than linked, so the Go binaries stay pure and
+build without a C toolchain
+([ADR-0005](docs/decisions/0005-native-c-dynamically-loaded.md)).
+
+It is compiled with `-Wall -Wextra -Wpedantic -Wconversion -Werror`, and the part that can
+corrupt memory — the bounded writer that fills the caller's buffer — never advances a
+cursor. It tracks how many bytes the output *would* need and writes a byte only when its
+index is inside the capacity, so the arithmetic that is usually wrong does not exist and
+the required size for a retry falls out of the same counter. Its tests write every prefix
+from zero to the required length with guard bytes on both sides of the buffer.
 
 Transport security is **TLS 1.3 with mutual TLS**, Ed25519 throughout — the authority,
 the certificates, and later the grants use one signature primitive rather than several.
@@ -564,6 +594,17 @@ TIME                 EVENT           ACTOR  DEVICE        RESOURCE         GRANT
 
 Payload bytes never appear here. Neither do tokens, keys, or grant signatures.
 
+**Optional: network diagnostics.** If the C library is built and installed beside the
+agent, it can describe the endpoint's network without anyone logging in to it:
+
+```sh
+make native                 # or: .\scripts\task.ps1 native
+./bin/sar-agent diag        # adapters, addresses, routes, DNS, proxy — as JSON
+```
+
+The agent verifies the library's signature before loading it, so a locally built one is
+refused until you pass `-allow-unsigned`. Nothing about access depends on it.
+
 **5. Take access back.** Revoking a grant drops the streams it opened, not just the next
 one:
 
@@ -655,6 +696,7 @@ make lint       # go vet + gofmt check
 make test       # fast unit and wiring tests
 make test-race  # same, under the race detector
 make build      # all three binaries
+make native     # the optional C library; needs a C compiler, nothing else does
 ```
 
 Without GNU make (typical on Windows), `scripts/task.ps1` mirrors every target:

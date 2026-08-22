@@ -52,6 +52,8 @@ func run() error {
 		return cmdEnroll(os.Args[2:])
 	case "run":
 		return cmdRun(os.Args[2:])
+	case "diag":
+		return cmdDiag(os.Args[2:])
 	case "service":
 		return cmdService(os.Args[2:])
 	case "-version", "--version", "version":
@@ -69,6 +71,7 @@ func usage() {
   enroll    obtain a certificate using an enrollment code
   run       connect to the relay and serve the configured resource
   service   install, uninstall, start, stop, or query the Windows service
+  diag      print a network diagnostics snapshot, if the optional library is present
 
 The same binary runs as a Windows service and in the foreground. Started by the
 service manager it reports status and answers stop and shutdown; started from a

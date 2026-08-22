@@ -126,6 +126,10 @@ Tuning knobs worth knowing, all of which have working defaults:
   sar-server run -cert-ttl                               certificate lifetime; short
                                                          values make renewal observable
   sar-server audit -stats / -prune-older-than / -confirm  trail size and retention
+  sar-agent  diag -lib-dir / -allow-unsigned              network snapshot; unsigned
+                                                          is for development only
+  sar-agent  diag -interface <luid>                       one interface instead of
+                                                          the whole machine
   ca/            development certificate authority: issues and parses identities
   keystore/      private key at rest; DPAPI on Windows, file permissions elsewhere
   identity/      a peer's own key, certificate, and trust anchor; enrollment client
@@ -137,8 +141,11 @@ Tuning knobs worth knowing, all of which have working defaults:
   config/ logging/
   e2e/           every component wired together in one process
   winsvc/        Windows service: SCM dispatcher, install, start, stop, status
-  winpipe/ wfp/ diagbridge/                    all //go:build windows
-native/sardiag/  include/ src/ tests/   C diagnostics library
+  diagbridge/    loads the optional sardiag library: path pinning, signature
+                 verification, ABI version check      //go:build windows
+  winpipe/ wfp/                                       all //go:build windows
+native/sardiag/  include/ src/ tests/   C diagnostics library, optional at runtime
+                 build with `scripts/task.ps1 native` or `make native`
 deploy/          docker compose for control plane, relay, and database
 installer/       PowerShell installer, then WiX/MSI
 scripts/         task.ps1 (Windows task runner)

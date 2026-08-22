@@ -34,6 +34,15 @@
     Local service to expose. Must be a loopback literal with an explicit port;
     the agent refuses to start otherwise.
 
+.PARAMETER WithDiagnostics
+    Also install sardiag.dll, the optional network diagnostics library, if it is
+    present beside the agent binary. The agent runs identically without it; the
+    only difference is whether 'sar-agent diag' has anything to report.
+
+    The library is loaded from the install directory by absolute path and its
+    Authenticode signature is verified before it is mapped, so an unsigned build
+    installed here will be refused at runtime rather than trusted.
+
 .EXAMPLE
     .\install.ps1 -EnrollmentCode sar1.eyJ... -RelayAddr relay.example:443 `
                  -ControlAddr relay.example:17071 -Target 127.0.0.1:8080
@@ -45,7 +54,8 @@ param(
     [string]$RelayAddr   = "127.0.0.1:17070",
     [string]$ControlAddr = "",
     [string]$Target      = "127.0.0.1:8080",
-    [string]$LogLevel    = "info"
+    [string]$LogLevel    = "info",
+    [switch]$WithDiagnostics
 )
 
 $ErrorActionPreference = 'Stop'
@@ -95,6 +105,23 @@ if (-not (Test-Path $InstallDir)) {
 }
 Copy-Item -Path $SourceExe -Destination $InstallDir -Force
 $InstalledExe = Join-Path $InstallDir 'sar-agent.exe'
+
+# The optional diagnostics library, alongside the binary so the agent finds it by
+# absolute path rather than by searching. Copied only when asked for: it is not
+# needed to run, and installing a component nobody requested is how an optional
+# dependency stops being optional.
+if ($WithDiagnostics) {
+    $SourceDll = Join-Path (Split-Path -Parent $SourceExe) 'sardiag.dll'
+    if (Test-Path $SourceDll) {
+        Copy-Item -Path $SourceDll -Destination $InstallDir -Force
+        Write-Step 'Installed the diagnostics library'
+        Write-Host '      the agent verifies its Authenticode signature before loading it;' -ForegroundColor DarkGray
+        Write-Host '      an unsigned build will be refused at runtime' -ForegroundColor DarkGray
+    } else {
+        Write-Warning "sardiag.dll not found beside $SourceExe; diagnostics will be unavailable."
+        Write-Warning "The agent is unaffected - only 'sar-agent diag' needs it."
+    }
+}
 
 # --- state directory and its ACL ---------------------------------------------
 #

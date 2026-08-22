@@ -41,6 +41,36 @@ Justified when the native code is untrusted or crash-prone. This library only re
 system state; the process boundary would add IPC, lifecycle management, and a second
 binary to install for no security gain.
 
+## Implementation status
+
+**Implemented.** `native/sardiag` is a C99 library built with
+`-Wall -Wextra -Wpedantic -Wconversion -Werror`, and `internal/diagbridge` loads
+it. `sar-agent diag` prints the snapshot.
+
+Two details of this record were overtaken by later decisions and are worth
+naming rather than leaving to be discovered:
+
+- It says the library is loaded via `golang.org/x/sys/windows`. It is loaded
+  through the standard library's `syscall` package instead, following
+  [ADR-0012](0012-win32-through-stdlib.md), which was accepted afterwards and
+  applies the same rule to DPAPI, the service control manager, and the Event Log.
+- The signatures here take `uint8_t *out, uint32_t cap, uint32_t *out_len`, which
+  is exactly what shipped. What this record did not settle is what goes *in* the
+  buffer: it is UTF-8 JSON, so no struct crosses the boundary and neither
+  compiler needs to agree with the other about packing, alignment, or field
+  order. That turned out to be the decision that made the ABI boring.
+
+The mandatory tests this record calls for exist: buffer capacity, exact-fit,
+one-byte-short, every prefix from zero to the required size, and the error paths.
+Each runs with guard bytes on both sides of the output buffer, because a test
+that only checked the returned length would not notice a write past the end.
+
+Authenticode verification is implemented through `WinVerifyTrust` and runs
+*before* the library is mapped — verifying afterwards would be verifying code
+that had already executed. An unsigned library is refused unless an administrator
+passes `-allow-unsigned`, which exists because a locally built library is signed
+by nobody and the worst case of loading one is a degraded support bundle.
+
 ## Consequences
 
 - The agent stays pure Go and `CGO_ENABLED=0` (see [ADR-0006](0006-cgo-disabled-pure-go-sqlite.md)).
