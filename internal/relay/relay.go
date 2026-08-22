@@ -24,10 +24,14 @@
 // only one, a compromised relay could open any stream it liked — which is
 // exactly what invariant 2 forbids.
 //
-// # Not finished
+// # Revocation
 //
-// There is no queryable audit trail, and a grant cannot be revoked before it
-// expires.
+// A grant can be revoked before it expires. The relay checks a grant's state
+// with the control plane when a stream is opened, and it registers every joined
+// stream against the grant that authorized it so that a revocation arriving
+// mid-session drops the streams already running. Both ends are reset: leaving
+// the agent's side open would leave the local service connected, which is the
+// thing the revocation was taking away.
 package relay
 
 import (
@@ -48,6 +52,7 @@ import (
 	"github.com/rilegu/secure-access-relay/internal/bridge"
 	"github.com/rilegu/secure-access-relay/internal/mux"
 	"github.com/rilegu/secure-access-relay/internal/proto"
+	"github.com/rilegu/secure-access-relay/internal/relay/authorization"
 	"github.com/rilegu/secure-access-relay/internal/relay/sessions"
 	"github.com/rilegu/secure-access-relay/internal/transport"
 )
@@ -85,6 +90,19 @@ type Config struct {
 	// liked, which is precisely what invariant 2 forbids.
 	GrantKey ed25519.PublicKey
 
+	// Grants resolves a grant's current state, so a revoked grant is refused
+	// rather than merely expiring eventually.
+	//
+	// Optional. Without it the relay still checks signature, expiry, user and
+	// device, and revocation takes effect only when the grant expires. A relay
+	// running without it says so at startup rather than leaving an administrator
+	// to assume revocation works.
+	Grants authorization.GrantChecker
+
+	// Audit records stream lifecycle events. Optional; without it the relay logs
+	// but nothing is queryable afterwards.
+	Audit StreamAuditor
+
 	// MaxStreams caps concurrent streams per session.
 	MaxStreams uint32
 
@@ -97,11 +115,28 @@ type Config struct {
 	Logger *slog.Logger
 }
 
+// StreamAuditor records what the relay did with a stream.
+//
+// An interface for the same reason Verifier is one: the relay must not import
+// the control plane. A nil auditor is valid and means events are logged only.
+type StreamAuditor interface {
+	StreamOpened(ctx context.Context, userID, deviceID, resourceID, grantID, sessionID string)
+	StreamDenied(ctx context.Context, userID, deviceID, resourceID, grantID, reason, detail string)
+	StreamClosed(ctx context.Context, userID, deviceID, resourceID, grantID string,
+		bytesIn, bytesOut uint64, duration time.Duration, reason string)
+	DeviceConnected(ctx context.Context, deviceID, detail string)
+	DeviceDisconnected(ctx context.Context, deviceID, reason string)
+}
+
 // Server is a running relay.
 type Server struct {
 	cfg      Config
 	log      *slog.Logger
 	registry *sessions.Registry
+
+	// live tracks joined streams by grant, so a revocation can reach a session
+	// that is already running.
+	live *authorization.LiveStreams
 
 	nextSession atomic.Uint64
 
@@ -143,9 +178,30 @@ func New(cfg Config) (*Server, error) {
 		cfg:      cfg,
 		log:      cfg.Logger,
 		registry: sessions.NewRegistry(),
+		live:     authorization.NewLiveStreams(),
 		ready:    make(chan struct{}),
 	}, nil
 }
+
+// TerminateGrants drops every live stream opened under any of the named grants.
+//
+// This is the relay's half of revocation. The control plane records that a grant
+// is no longer valid; this makes that true on the wire, for sessions that were
+// already running when the decision was made.
+//
+// Safe to call with grants that have no live streams, which is the common case:
+// most revocations catch a grant nobody is currently using.
+func (s *Server) TerminateGrants(grantIDs []string) {
+	n := s.live.Terminate(grantIDs, proto.ReasonGrantRevoked)
+	if n > 0 {
+		s.log.Warn("dropped live streams for revoked grants",
+			"grants", len(grantIDs), "streams", n)
+	}
+}
+
+// LiveStreamCount reports how many joined streams the relay is carrying, for
+// status output and tests.
+func (s *Server) LiveStreamCount() int { return s.live.Count() }
 
 // Run listens and serves until ctx is cancelled.
 func (s *Server) Run(ctx context.Context) error {
@@ -336,11 +392,22 @@ func (s *Server) serveAgent(ctx context.Context, h *mux.Handshake, id ca.Identit
 
 	log := s.log.With("session_id", sessionID, "device_id", deviceID)
 	log.Info("agent connected", "agents", s.registry.Count())
+	if s.cfg.Audit != nil {
+		s.cfg.Audit.DeviceConnected(ctx, deviceID, "session "+sessionID)
+	}
 
 	defer func() {
 		s.registry.Remove(deviceID, sess)
 		_ = sess.Close(proto.ReasonShutdown)
-		log.Info("agent disconnected", "agents", s.registry.Count(), "reason", reasonOf(sess))
+		reason := reasonOf(sess)
+		log.Info("agent disconnected", "agents", s.registry.Count(), "reason", reason)
+		if s.cfg.Audit != nil {
+			// Recorded with the parent context rather than a cancelled one: this
+			// runs during shutdown, and an audit write that is skipped because the
+			// context is already done would lose the disconnection of every
+			// endpoint at exactly the moment the record is most useful.
+			s.cfg.Audit.DeviceDisconnected(context.WithoutCancel(ctx), deviceID, reason)
+		}
 	}()
 
 	// The relay opens streams toward an agent and never accepts them from one, so
@@ -459,6 +526,39 @@ func (s *Server) joinStream(ctx context.Context, log *slog.Logger, op *mux.Strea
 
 	log = log.With("grant_id", grant.GrantID, "resource_id", grant.ResourceID)
 
+	// Revocation. The signature says the control plane issued this grant; it
+	// cannot say the grant is still wanted. Only a live check can, which is why
+	// this is a lookup rather than something carried inside the signed bytes.
+	//
+	// A grant is refused if the control plane says it was revoked. A lookup that
+	// *fails* is not treated as a revocation: a database hiccup must not take
+	// access away from everyone at once, and the agent's own check still stands
+	// behind this one.
+	sessionID := ""
+	if s.cfg.Grants != nil {
+		checkCtx, cancelCheck := context.WithTimeout(ctx, grantCheckTimeout)
+		state, err := s.cfg.Grants.CheckGrant(checkCtx, grant.GrantID)
+		cancelCheck()
+
+		switch {
+		case err != nil:
+			log.Error("could not check grant revocation; allowing on the agent's authority",
+				"error", err)
+		case !state.Known:
+			// A correctly signed grant this control plane never issued. Either the
+			// database lost it or the signing key is being used somewhere else, and
+			// both deserve a loud line rather than a quiet allow.
+			log.Warn("grant is correctly signed but unknown to the control plane")
+		case state.Revoked:
+			log.Info("stream refused", "reason", proto.ReasonGrantRevoked.String())
+			s.auditDenied(ctx, grant, proto.ReasonGrantRevoked, "grant revoked before expiry")
+			_ = op.Reset(proto.ReasonGrantRevoked)
+			return
+		default:
+			sessionID = state.SessionID
+		}
+	}
+
 	openCtx, cancel := context.WithTimeout(ctx, proto.DialTimeout+time.Second)
 	// The same grant bytes are forwarded unchanged. The relay does not re-sign,
 	// re-encode, or amend anything: the agent must verify exactly what the
@@ -471,12 +571,22 @@ func (s *Server) joinStream(ctx context.Context, log *slog.Logger, op *mux.Strea
 			reason = proto.ReasonLimitStreamsExceeded
 		}
 		log.Info("could not open endpoint stream", "reason", reason.String(), "error", err)
+		s.auditDenied(ctx, grant, reason, err.Error())
 		_ = op.Reset(reason)
 		return
 	}
 
+	// Registered before any bytes move, and deregistered however this returns. A
+	// stream that is carrying data but is not in the register would survive a
+	// revocation, which is the one case this whole mechanism exists for.
+	release := s.live.Add(grant.GrantID, op, agentStream)
+	defer release()
+
 	start := time.Now()
-	log.Info("stream joined", "agent_stream", agentStream.ID())
+	log.Info("stream joined", "agent_stream", agentStream.ID(), "session_id", sessionID)
+	if s.cfg.Audit != nil {
+		s.cfg.Audit.StreamOpened(ctx, grant.UserID, grant.DeviceID, grant.ResourceID, grant.GrantID, sessionID)
+	}
 
 	stats, joinErr := bridge.Join(op, agentStream)
 
@@ -486,12 +596,36 @@ func (s *Server) joinStream(ctx context.Context, log *slog.Logger, op *mux.Strea
 	if joinErr != nil {
 		reason = proto.ReasonShutdown
 	}
+	elapsed := time.Since(start)
 	log.Info("stream closed",
 		"reason", reason.String(),
 		"bytes_to_agent", stats.AToB,
 		"bytes_to_operator", stats.BToA,
-		"duration_ms", time.Since(start).Milliseconds(),
+		"duration_ms", elapsed.Milliseconds(),
 	)
+	if s.cfg.Audit != nil {
+		// Byte counts cross into the audit record unsigned: a transfer total is
+		// never negative, and the copy loop's int64 is an artefact of io, not a
+		// property worth carrying into evidence.
+		s.cfg.Audit.StreamClosed(ctx, grant.UserID, grant.DeviceID, grant.ResourceID, grant.GrantID,
+			uint64(stats.AToB), uint64(stats.BToA), elapsed, reason.String())
+	}
+}
+
+// grantCheckTimeout bounds the revocation lookup.
+//
+// It is a primary-key read against a local database, so this is generous. The
+// bound exists so that a stalled store degrades to "allow, and let the agent
+// decide" rather than hanging every stream open in the deployment.
+const grantCheckTimeout = 2 * time.Second
+
+// auditDenied records a refused stream, if auditing is configured.
+func (s *Server) auditDenied(ctx context.Context, grant *proto.SignedGrant, reason proto.Reason, detail string) {
+	if s.cfg.Audit == nil {
+		return
+	}
+	s.cfg.Audit.StreamDenied(ctx, grant.UserID, grant.DeviceID, grant.ResourceID,
+		grant.GrantID, reason.String(), detail)
 }
 
 func (s *Server) newSessionID(prefix string) string {

@@ -31,15 +31,18 @@ import (
 
 	"github.com/rilegu/secure-access-relay/internal/agent"
 	"github.com/rilegu/secure-access-relay/internal/ca"
+	"github.com/rilegu/secure-access-relay/internal/control/audit"
 	"github.com/rilegu/secure-access-relay/internal/control/enrollment"
 	"github.com/rilegu/secure-access-relay/internal/control/grants"
 	"github.com/rilegu/secure-access-relay/internal/control/httpapi"
+	"github.com/rilegu/secure-access-relay/internal/control/login"
 	"github.com/rilegu/secure-access-relay/internal/control/policy"
 	"github.com/rilegu/secure-access-relay/internal/identity"
 	"github.com/rilegu/secure-access-relay/internal/mux"
 	"github.com/rilegu/secure-access-relay/internal/operator"
 	"github.com/rilegu/secure-access-relay/internal/proto"
 	"github.com/rilegu/secure-access-relay/internal/relay"
+	"github.com/rilegu/secure-access-relay/internal/relay/authorization"
 	"github.com/rilegu/secure-access-relay/internal/storage"
 	"github.com/rilegu/secure-access-relay/internal/transport"
 )
@@ -78,10 +81,18 @@ type deployment struct {
 	store      *storage.Store
 	enroll     *enrollment.Service
 	issuer     *grants.Issuer
+	login      *login.Service
+	audit      *audit.Recorder
 	rules      []policy.Rule
 	serverCert tls.Certificate
 
 	controlAddr string
+
+	// relay is set once startRelay has run, so the control plane can drop live
+	// streams when a grant is revoked. The wiring is the same one cmd/sar-server
+	// performs, because a test that wired it differently would not be testing
+	// revocation as it ships.
+	relay *relay.Server
 }
 
 func newDeployment(t *testing.T) *deployment {
@@ -91,10 +102,11 @@ func newDeployment(t *testing.T) *deployment {
 	if err != nil {
 		t.Fatalf("create authority: %v", err)
 	}
-	store, err := storage.Open(filepath.Join(t.TempDir(), "control.json"))
+	store, err := storage.Open(filepath.Join(t.TempDir(), "control.db"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
+	t.Cleanup(func() { _ = store.Close() })
 	serverCert, err := authority.IssueServerCertificate([]string{"localhost", "127.0.0.1", "::1"}, time.Hour)
 	if err != nil {
 		t.Fatalf("issue server certificate: %v", err)
@@ -108,6 +120,10 @@ func newDeployment(t *testing.T) *deployment {
 	if err != nil {
 		t.Fatalf("create issuer: %v", err)
 	}
+	// Recording is wired in tests too. A grant issued without a record is a
+	// different code path from the one that ships, and the deny tests assert on
+	// what the trail says.
+	issuer = issuer.WithStore(store)
 
 	return &deployment{
 		t:          t,
@@ -115,6 +131,8 @@ func newDeployment(t *testing.T) *deployment {
 		store:      store,
 		enroll:     enrollment.New(store, authority, issuer.PublicKey()),
 		issuer:     issuer,
+		login:      login.New(store, login.DefaultTTL),
+		audit:      audit.NewRecorder(store, discardLogger()),
 		serverCert: serverCert,
 		// Allows the standard test operator to reach the standard test resource
 		// on the standard test device, and nothing else. Tests that need a
@@ -150,6 +168,18 @@ func (d *deployment) startControlPlane(ctx context.Context) {
 		TLS:    tlsCfg,
 		Issuer: d.issuer,
 		Rules:  func() []policy.Rule { return d.rules },
+		Login:  d.login,
+		Audit:  d.audit,
+
+		// Resolved lazily: the relay may not exist yet, because some tests start
+		// the control plane first. Reading it at call time rather than at
+		// construction is what lets both orders work.
+		Terminate: func(grantIDs []string) {
+			if d.relay != nil {
+				d.relay.TerminateGrants(grantIDs)
+			}
+		},
+
 		Logger: discardLogger(),
 	}, d.enroll)
 	if err != nil {
@@ -224,10 +254,26 @@ func (d *deployment) startRelay(ctx context.Context, maxStreams uint32) *relay.S
 	d.t.Helper()
 
 	srv, err := relay.New(relay.Config{
-		Addr:       "127.0.0.1:0",
-		TLS:        transport.ServerTLS(d.serverCert, d.authority.Pool()),
-		Verify:     d.enroll,
-		GrantKey:   d.issuer.PublicKey(),
+		Addr:     "127.0.0.1:0",
+		TLS:      transport.ServerTLS(d.serverCert, d.authority.Pool()),
+		Verify:   d.enroll,
+		GrantKey: d.issuer.PublicKey(),
+
+		// The revocation lookup, wired exactly as cmd/sar-server wires it.
+		Grants: authorization.CheckerFunc(func(ctx context.Context, grantID string) (authorization.GrantState, error) {
+			st, err := grants.StateOf(ctx, d.store, grantID)
+			if err != nil {
+				return authorization.GrantState{}, err
+			}
+			return authorization.GrantState{
+				Known:     st.Known,
+				Revoked:   st.Revoked,
+				SessionID: st.SessionID,
+				UserID:    st.UserID,
+			}, nil
+		}),
+
+		Audit:      d.audit,
 		MaxStreams: maxStreams,
 		Logger:     discardLogger(),
 	})
@@ -236,7 +282,32 @@ func (d *deployment) startRelay(ctx context.Context, maxStreams uint32) *relay.S
 	}
 	go func() { _ = srv.Run(ctx) }()
 	waitReady(d.t, srv.Ready(), "relay")
+	d.relay = srv
 	return srv
+}
+
+// session opens an operator session, the way sarctl does before requesting a
+// grant.
+func (d *deployment) session(ctx context.Context, id *identity.Identity) login.Session {
+	d.t.Helper()
+
+	sess, err := d.login.Begin(ctx, id.ID.ID, "127.0.0.1")
+	if err != nil {
+		d.t.Fatalf("open session for %s: %v", id.ID.ID, err)
+	}
+	return sess
+}
+
+// sessionTokenFor returns a grant-request session provider for an identity,
+// matching what cmd/sarctl supplies to the forwarder.
+func (d *deployment) sessionTokenFor(id *identity.Identity) func(context.Context) (string, error) {
+	return func(ctx context.Context) (string, error) {
+		sess, err := d.login.Begin(ctx, id.ID.ID, "127.0.0.1")
+		if err != nil {
+			return "", err
+		}
+		return sess.Token, nil
+	}
 }
 
 // newCSR generates a key and a certificate request for it.
@@ -343,13 +414,15 @@ func buildHarness(t *testing.T, opt options) *harness {
 		waitForAgent(t, h.Relay, 1)
 	}
 
+	operatorID := h.Dep.enrollIdentity(ca.RoleOperator, testUserID)
 	f, err := operator.New(operator.Config{
 		RelayAddr:   h.Relay.Addr(),
 		ControlAddr: h.Dep.controlAddr,
-		Identity:    h.Dep.enrollIdentity(ca.RoleOperator, testUserID),
+		Identity:    operatorID,
 		ListenAddr:  "127.0.0.1:0",
 		DeviceID:    testDeviceID,
 		Resource:    testResourceID,
+		Session:     h.Dep.sessionTokenFor(operatorID),
 		Logger:      log,
 	})
 	if err != nil {
@@ -447,6 +520,33 @@ func fixtureHandler() http.Handler {
 	mux.HandleFunc("/echo", func(w http.ResponseWriter, r *http.Request) {
 		defer func() { _ = r.Body.Close() }()
 		_, _ = io.Copy(w, r.Body)
+	})
+
+	// A response that will not finish on its own, so a test can hold a stream
+	// open and act on it while it is live. It ends when the request context is
+	// cancelled, which is what happens when the stream carrying it is cut.
+	mux.HandleFunc("/slow", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		// Headers first, so the client has a response in flight rather than
+		// waiting for one that never starts.
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		tick := time.NewTicker(20 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-tick.C:
+				if _, err := w.Write([]byte(".")); err != nil {
+					return
+				}
+				if f, ok := w.(http.Flusher); ok {
+					f.Flush()
+				}
+			}
+		}
 	})
 
 	return mux
@@ -552,7 +652,10 @@ func dialAndOpen(t *testing.T, relayAddr string, id *identity.Identity, deviceID
 }
 
 // postGrant asks the control plane for a grant, optionally without credentials.
-func postGrant(t *testing.T, controlAddr string, id *identity.Identity, deviceID, resourceID string) (string, int, error) {
+//
+// The session token is optional too, so a test can check what happens when a
+// certificate is presented without one.
+func postGrant(t *testing.T, controlAddr string, id *identity.Identity, deviceID, resourceID string, token ...string) (string, int, error) {
 	t.Helper()
 
 	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS13, InsecureSkipVerify: true}
@@ -570,6 +673,9 @@ func postGrant(t *testing.T, controlAddr string, id *identity.Identity, deviceID
 		return "", 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if len(token) > 0 && token[0] != "" {
+		req.Header.Set("Authorization", "Bearer "+token[0])
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {

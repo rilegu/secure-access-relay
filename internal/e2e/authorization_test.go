@@ -130,13 +130,15 @@ func TestAgentRefusesUndeclaredResource(t *testing.T) {
 	go func() { _ = a.Run(ctx) }()
 	waitForAgent(t, relaySrv, 1)
 
+	operatorID := dep.enrollIdentity(ca.RoleOperator, testUserID)
 	f, err := operator.New(operator.Config{
 		RelayAddr:   relaySrv.Addr(),
 		ControlAddr: dep.controlAddr,
-		Identity:    dep.enrollIdentity(ca.RoleOperator, testUserID),
+		Identity:    operatorID,
 		ListenAddr:  "127.0.0.1:0",
 		DeviceID:    testDeviceID,
 		Resource:    "res_the_agent_does_not_serve",
+		Session:     dep.sessionTokenFor(operatorID),
 		Logger:      discardLogger(),
 	})
 	if err != nil {
@@ -184,7 +186,7 @@ func TestExpiredGrantIsRefused(t *testing.T) {
 
 	// Verify the expiry logic directly rather than waiting a minute: issue a
 	// grant, then check that a verifier at a later time refuses it.
-	signed, _, err := h.Dep.issuer.Issue(h.Dep.rules, grants.Request{
+	signed, _, err := h.Dep.issuer.Issue(context.Background(), h.Dep.rules, grants.Request{
 		UserID:       testUserID,
 		DeviceID:     testDeviceID,
 		ResourceID:   testResourceID,
@@ -218,7 +220,7 @@ func TestGrantIsBoundToItsRequester(t *testing.T) {
 	})
 
 	// A grant legitimately issued to the permitted operator.
-	signed, _, err := h.Dep.issuer.Issue(h.Dep.rules, grants.Request{
+	signed, _, err := h.Dep.issuer.Issue(context.Background(), h.Dep.rules, grants.Request{
 		UserID:       testUserID,
 		DeviceID:     testDeviceID,
 		ResourceID:   testResourceID,
@@ -258,8 +260,13 @@ func TestOperatorCannotRequestGrantAsAnotherUser(t *testing.T) {
 	dep.startControlPlane(ctx)
 
 	// An enrolled operator who is not maria asks for the same access.
+	//
+	// They log in first: the session check comes before policy, and this test is
+	// about policy. Skipping the login would test that a session is required,
+	// which TestGrantRequiresASession already does.
 	intruder := dep.enrollIdentity(ca.RoleOperator, "usr_intruder")
-	body, status, err := postGrant(t, dep.controlAddr, intruder, testDeviceID, testResourceID)
+	sess := dep.session(ctx, intruder)
+	body, status, err := postGrant(t, dep.controlAddr, intruder, testDeviceID, testResourceID, sess.Token)
 	if err != nil {
 		t.Fatalf("request: %v", err)
 	}

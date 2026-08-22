@@ -78,6 +78,27 @@ never intended to survive past enrollment.
 - Audit becomes queryable, which is what makes it useful as evidence rather than as a
   log nobody reads.
 
+## Implementation status
+
+**Implemented.** `internal/storage` holds identities, enrollment tokens, operator
+sessions, grants, and `audit_events`, with numbered migrations in `migrate.go` and the
+schema version in SQLite's `user_version` pragma. A database newer than the binary is a
+startup failure.
+
+Two consequences this record predicted have been paid in full:
+
+- The zero-dependency property is gone. The README now describes the rule — every
+  dependency must survive *"why not the standard library?"* — rather than the number, and
+  names the one that survived it.
+- Migrations exist and are append-only. A released migration is never edited, because two
+  deployments claiming the same schema version with different tables would make the
+  version number meaningless.
+
+The transactional argument turned out to be the load-bearing one. `RecordGrant` writes the
+grant and its audit event in a single transaction, so there is no window in which access
+exists without a record of it — which a key-value store plus a separate log file could not
+have provided.
+
 ## Not affected
 
 Key material does not go in the database. The authority key, device keys, and the grant

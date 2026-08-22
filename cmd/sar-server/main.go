@@ -12,8 +12,9 @@
 // issued. The relay carries traffic under that grant, and the endpoint agent
 // verifies it independently before dialing anything.
 //
-// There is no queryable audit trail yet, and a grant cannot be revoked before it
-// expires.
+// Every authorization decision is recorded in an append-only audit trail, and a
+// grant can be revoked before it expires — which drops the streams it opened
+// rather than only refusing the next one.
 //
 // Usage:
 //
@@ -22,6 +23,10 @@
 //	sar-server token -operator maria     mint an enrollment code for an operator
 //	sar-server revoke -device panel-01   revoke an identity
 //	sar-server list                      show enrolled identities
+//	sar-server audit -device panel-01    query the audit trail
+//	sar-server grants -active            show issued grants
+//	sar-server grants -revoke grn_...    revoke a grant before it expires
+//	sar-server sessions -active          show operator sessions
 package main
 
 import (
@@ -43,13 +48,16 @@ import (
 	"time"
 
 	"github.com/rilegu/secure-access-relay/internal/ca"
+	"github.com/rilegu/secure-access-relay/internal/control/audit"
 	"github.com/rilegu/secure-access-relay/internal/control/enrollment"
 	"github.com/rilegu/secure-access-relay/internal/control/grants"
 	"github.com/rilegu/secure-access-relay/internal/control/httpapi"
+	"github.com/rilegu/secure-access-relay/internal/control/login"
 	"github.com/rilegu/secure-access-relay/internal/control/policy"
 	"github.com/rilegu/secure-access-relay/internal/keystore"
 	"github.com/rilegu/secure-access-relay/internal/logging"
 	"github.com/rilegu/secure-access-relay/internal/relay"
+	"github.com/rilegu/secure-access-relay/internal/relay/authorization"
 	"github.com/rilegu/secure-access-relay/internal/storage"
 	"github.com/rilegu/secure-access-relay/internal/transport"
 )
@@ -91,6 +99,12 @@ func run() error {
 		return cmdRevoke(os.Args[2:])
 	case "list":
 		return cmdList(os.Args[2:])
+	case "audit":
+		return cmdAudit(os.Args[2:])
+	case "grants":
+		return cmdGrants(os.Args[2:])
+	case "sessions":
+		return cmdSessions(os.Args[2:])
 	case "-version", "--version", "version":
 		fmt.Println(version)
 		return nil
@@ -107,6 +121,9 @@ func usage() {
   token     mint a single-use enrollment code
   revoke    revoke an enrolled identity
   list      show enrolled identities
+  audit     query the audit trail
+  grants    list or revoke issued grants
+  sessions  list or revoke operator sessions
 
 Run a command with -h for its options.
 `)
@@ -118,6 +135,17 @@ type deployment struct {
 	store     *storage.Store
 	enroll    *enrollment.Service
 	issuer    *grants.Issuer
+	login     *login.Service
+	audit     *audit.Recorder
+}
+
+// close releases the database. Every command that opens a deployment must call
+// it: SQLite in WAL mode leaves a journal behind, and a control plane that shut
+// down without closing looks corrupt to the next tool that opens it.
+func (d *deployment) close() {
+	if d.store != nil {
+		_ = d.store.Close()
+	}
 }
 
 // openDeployment loads the authority and store, creating them on first use.
@@ -169,21 +197,41 @@ func openDeployment(stateDir string) (*deployment, error) {
 		return nil, fmt.Errorf("authority state in %s is incomplete; refusing to guess", stateDir)
 	}
 
-	store, err := storage.Open(filepath.Join(stateDir, "control.json"))
+	store, err := storage.Open(filepath.Join(stateDir, "control.db"))
 	if err != nil {
 		return nil, err
 	}
 
-	issuer, err := openIssuer(stateDir)
+	// A deployment upgraded from the JSON store keeps its enrolled identities.
+	// Losing them would leave every device holding a certificate the control
+	// plane no longer recognises, and the only symptom would be endpoints that
+	// silently stop connecting.
+	imported, err := store.ImportLegacyJSON(context.Background(), filepath.Join(stateDir, "control.json"))
 	if err != nil {
+		_ = store.Close()
 		return nil, err
 	}
+	if imported > 0 {
+		fmt.Fprintf(os.Stderr, "imported %d records from control.json into control.db\n", imported)
+	}
+
+	issuer, err := openIssuer(stateDir)
+	if err != nil {
+		_ = store.Close()
+		return nil, err
+	}
+	// Attached here rather than at construction: the signing key and the database
+	// are opened by different code paths, and threading one through the other
+	// would couple two things with no reason to know about each other.
+	issuer = issuer.WithStore(store)
 
 	return &deployment{
 		authority: authority,
 		store:     store,
 		enroll:    enrollment.New(store, authority, issuer.PublicKey()),
 		issuer:    issuer,
+		login:     login.New(store, login.DefaultTTL),
+		audit:     audit.NewRecorder(store, logging.New("info")),
 	}, nil
 }
 
@@ -277,6 +325,7 @@ func cmdRun(args []string) error {
 	if err != nil {
 		return err
 	}
+	defer dep.close()
 
 	serverCert, err := dep.authority.IssueServerCertificate(splitList(*tlsNames), serverCertTTL)
 	if err != nil {
@@ -287,12 +336,51 @@ func cmdRun(args []string) error {
 		"state_dir", *stateDir,
 		"fingerprint", enrollment.Fingerprint(dep.authority.Certificate()),
 		"grant_key_id", dep.issuer.KeyID(),
+		"database", dep.store.Path(),
+		"schema_version", storage.SchemaVersion,
+		"recording_grants", dep.issuer.Recording(),
+		"session_ttl", dep.login.TTL().String(),
 	)
 
 	rules := loadRules(*stateDir, log)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// The relay is constructed first because the control plane holds a reference
+	// into it: revoking a grant has to drop the streams that grant opened, and
+	// the relay is what holds those connections. The dependency runs one way —
+	// the control plane decides, the relay is told — which is why this is a
+	// function value and not an import.
+	srv, err := relay.New(relay.Config{
+		Addr:     *addr,
+		TLS:      transport.ServerTLS(serverCert, dep.authority.Pool()),
+		Verify:   dep.enroll,
+		GrantKey: dep.issuer.PublicKey(),
+
+		// Revocation lookup. The relay asks whether a grant is still wanted; a
+		// signature cannot answer that, because it was produced before anyone
+		// decided to take the access away.
+		Grants: authorization.CheckerFunc(func(ctx context.Context, grantID string) (authorization.GrantState, error) {
+			st, err := grants.StateOf(ctx, dep.store, grantID)
+			if err != nil {
+				return authorization.GrantState{}, err
+			}
+			return authorization.GrantState{
+				Known:     st.Known,
+				Revoked:   st.Revoked,
+				SessionID: st.SessionID,
+				UserID:    st.UserID,
+			}, nil
+		}),
+
+		Audit:      dep.audit,
+		MaxStreams: uint32(*maxStreams),
+		Logger:     log,
+	})
+	if err != nil {
+		return err
+	}
 
 	// Control plane: server-authenticated TLS only. A peer that is enrolling has
 	// no certificate yet, so requiring one here would make enrollment impossible.
@@ -310,22 +398,16 @@ func cmdRun(args []string) error {
 		},
 		Issuer: dep.issuer,
 		Rules:  func() []policy.Rule { return rules },
+		Login:  dep.login,
+		Audit:  dep.audit,
+
+		// What makes revocation reach a session already running. Without this a
+		// revoked grant would stop the next stream and leave the current one
+		// alone, which is precisely the case revocation exists for.
+		Terminate: srv.TerminateGrants,
+
 		Logger: log,
 	}, dep.enroll)
-	if err != nil {
-		return err
-	}
-
-	// Data plane: mutual TLS. A peer without a certificate from this authority
-	// never reaches the protocol.
-	srv, err := relay.New(relay.Config{
-		Addr:       *addr,
-		TLS:        transport.ServerTLS(serverCert, dep.authority.Pool()),
-		Verify:     dep.enroll,
-		GrantKey:   dep.issuer.PublicKey(),
-		MaxStreams: uint32(*maxStreams),
-		Logger:     log,
-	})
 	if err != nil {
 		return err
 	}
@@ -424,15 +506,71 @@ func cmdRevoke(args []string) error {
 	if err != nil {
 		return err
 	}
+	defer dep.close()
+
+	ctx := context.Background()
 	if err := dep.store.Revoke(role, id); err != nil {
 		return err
 	}
-
+	dep.audit.Record(ctx, storage.AuditEvent{
+		Event:     revokeEvent(role),
+		ActorRole: audit.RoleAdmin,
+		ActorID:   id,
+		DeviceID:  deviceOf(role, id),
+		Reason:    login.ReasonIdentityRevoked,
+	})
 	fmt.Printf("revoked %s/%s\n", role, id)
-	// Stated rather than glossed over: revocation is checked when a connection is
-	// established, so a session already running is unaffected until it ends.
-	fmt.Fprintln(os.Stderr, "note: existing sessions continue until they end; restart the relay to drop them")
+
+	// Revoking the identity is not enough on its own. Grants already issued stay
+	// signed and valid, so an operator cut off at the certificate would keep the
+	// access they were given until it expired — which is the opposite of what
+	// revoking them was meant to do.
+	switch role {
+	case "operator":
+		revoked, err := dep.login.EndAllForUser(ctx, id, "admin", login.ReasonIdentityRevoked)
+		if err != nil {
+			return fmt.Errorf("identity revoked, but its sessions and grants were not: %w", err)
+		}
+		fmt.Printf("ended their sessions and revoked %d grant(s)\n", len(revoked))
+	case "device":
+		revoked, err := dep.store.RevokeGrantsWhere(ctx, storage.ScopeDevice, id,
+			login.ReasonIdentityRevoked, storage.AuditEvent{
+				Event:     audit.EventGrantRevoked,
+				ActorRole: audit.RoleAdmin,
+				ActorID:   "admin",
+			})
+		if err != nil {
+			return fmt.Errorf("identity revoked, but grants naming it were not: %w", err)
+		}
+		fmt.Printf("revoked %d grant(s) naming this device\n", len(revoked))
+	}
+
+	// Said plainly, because it is the remaining gap. A running relay drops the
+	// streams itself; this command only writes to the database, so a relay in
+	// another process learns on its next lookup — which happens when a stream is
+	// opened, not while one is already running.
+	fmt.Fprintln(os.Stderr,
+		"note: a running relay drops affected streams on its next grant check; streams already joined")
+	fmt.Fprintln(os.Stderr,
+		"      end when this command is run against the same process, or when the grant expires")
 	return nil
+}
+
+// revokeEvent names the audit event for revoking an identity of a given role.
+func revokeEvent(role string) string {
+	if role == "operator" {
+		return audit.EventOperatorRevoked
+	}
+	return audit.EventDeviceRevoked
+}
+
+// deviceOf fills the device column only when the subject actually is a device,
+// so a query by device does not return operator events.
+func deviceOf(role, id string) string {
+	if role == "device" {
+		return id
+	}
+	return ""
 }
 
 func cmdList(args []string) error {
@@ -444,6 +582,7 @@ func cmdList(args []string) error {
 	if err != nil {
 		return err
 	}
+	defer dep.close()
 
 	for _, role := range []string{"device", "operator"} {
 		records := dep.store.List(role)

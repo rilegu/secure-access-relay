@@ -110,6 +110,17 @@ func (f *Forwarder) requestGrant(ctx context.Context) ([]byte, *proto.SignedGran
 	}
 	req.Header.Set("Content-Type", "application/json")
 
+	// The session token, when the deployment uses sessions. Fetched per request
+	// so a session renewed since the last grant is picked up without restarting
+	// the forward.
+	if f.cfg.Session != nil {
+		token, err := f.cfg.Session(ctx)
+		if err != nil {
+			return nil, nil, fmt.Errorf("no operator session: %w", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, nil, fmt.Errorf("request grant: %w", err)

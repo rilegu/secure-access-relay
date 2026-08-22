@@ -97,22 +97,26 @@ code and some are not, and the difference must be read before the table is.
 
 **Not yet implemented:**
 
-- **There is no audit trail.** Grants, denials, and sessions are all logged with the
-  identifiers needed to reconstruct what happened, but there is no queryable append-only
-  record and nothing is tamper-evident. T18 is unimplemented, and this is now the largest
-  remaining gap.
-- **Grants cannot be revoked before they expire.** Expiry is the only mechanism, bounded
-  at thirty minutes. Revoking a device or an operator stops *new* grants immediately, but
-  one already issued remains valid for its remaining life.
-- **Grants are not persisted.** They are signed and forgotten, so there is no record of
-  what was issued beyond the log line, and no list to revoke from.
-- **Revocation does not terminate live sessions.** It is checked when a connection is
-  established, so a session already running continues until it ends. T10 is therefore
-  only partially mitigated: restarting the relay is currently the way to drop them.
+- **The audit trail is not tamper-evident.** It is append-only in the software — nothing
+  in the code updates or deletes a row — and it is queryable by actor, device, resource,
+  grant, and event. It is not hash-chained, not signed, and not shipped anywhere. Anyone
+  with filesystem access to the control-plane database can edit it with a standard tool.
+  T18 is therefore mitigated against an operator and not against whoever runs the control
+  plane.
+- **Operator sessions are not a second authentication factor.** A session bounds and
+  groups access and can be revoked in one action; the certificate remains the only
+  credential, and anyone holding it can open a session.
+- **Revocation reaches live streams only within the relay process that holds them.** In
+  the shipped topology the relay and control plane are one process, so revoking a grant
+  drops its streams immediately. A relay deployed as a separate process would learn on
+  its next grant check — which happens at stream open — so a stream already joined would
+  continue until it ended or the grant expired.
 - **On platforms without DPAPI the key is protected by file permissions only.** Reported
   at startup rather than left to be assumed.
 - **Certificates are not renewed automatically.** They expire after thirty days and
   re-enrollment is manual.
+- **The control plane is a single node.** SQLite means one writer, one machine, no
+  replication, and no failover.
 
 ## Known limitations of the design
 
@@ -130,8 +134,10 @@ limitations is worse than one that names them.
   bottom of a trust chain.
 - **Clock skew** is a real weakness for short-TTL grants. v1 bounds tolerated skew and
   denies outside it; it does not implement a trusted time source.
-- **Audit log is append-only by convention, not cryptographically tamper-evident.**
-  Hash chaining is deliberately deferred.
+- **Audit log is append-only by construction, not cryptographically tamper-evident.**
+  The software never updates or deletes a row, but nothing stops someone with access to
+  the database file from doing so. Hash chaining and an external sink are deliberately
+  deferred.
 - **No device posture checks.** Enrollment proves key possession, not machine health.
 - **Single organization.** `organization_id` exists in the schema from day one, but
   multi-tenant isolation is not tested or claimed.

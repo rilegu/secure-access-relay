@@ -137,8 +137,8 @@ becomes reachable only through an authorized, time-bounded, recorded session.
 | Binary | Runs on | Role |
 | ------ | ------- | ---- |
 | `sar-agent` | the protected machine | Runs as a Windows service. Enrolls once, then holds an outbound mTLS session. Local resource allowlist, dials only loopback. Never listens. |
-| `sar-server` | a reachable VM you control | Control plane (certificate authority, enrollment, revocation) **and** relay (joins authorized streams). |
-| `sarctl` | the operator's laptop | Enrolls once, then opens a local loopback listener and carries it through the relay. |
+| `sar-server` | a reachable VM you control | Control plane (certificate authority, enrollment, policy, grants, sessions, audit trail) **and** relay (joins authorized streams). |
+| `sarctl` | the operator's laptop | Enrolls once, opens a session, then opens a local loopback listener and carries it through the relay. |
 | `sardiag` | the protected machine | Optional C diagnostics library, dynamically loaded. Not yet written. |
 
 The relay can be entirely self-hosted — a DMZ box, a VPS, your own cloud account. No
@@ -193,6 +193,29 @@ grant lapses, not merely refused at the moment it opens. Thirty minutes is the c
 regardless of what a policy asks for, checked both when a grant is issued and again when
 it is verified — so a compromised issuer cannot mint a year-long one.
 
+**Revocation reaches sessions already running.** Revoking a grant does not merely refuse
+the next stream; it drops the streams that grant already opened, at both ends. Half of a
+revocation would leave the agent holding an open connection to the local service, which
+is the thing being taken away. Ending an operator's session revokes the grants issued
+under it, and revoking an operator ends their sessions — because a revocation that leaves
+signed grants valid gives back, for up to half an hour, exactly what it was meant to
+remove.
+
+**A session is a revocation handle, not a second factor.** `sarctl login` opens one, and
+the certificate is what authenticates it — anyone holding the certificate can open a
+session, and no additional secret is required. What it buys is a lever shorter than a
+30-day certificate, and attribution: every grant records the session it was issued under,
+so an operator's activity during one incident is a single query rather than a
+reconstruction from timestamps. It is also the seam an identity provider plugs into later.
+
+**Every decision is written to a queryable audit trail.** Who connected, what they were
+granted and under which policy, every stream opened and refused with its reason code, and
+every finished stream's byte counts and duration. A grant and the record of that grant
+commit in one database transaction — access that nothing accounts for is worse than
+access refused, so if the record cannot be written the grant is not issued. Payload bytes,
+tokens, keys, and grant signatures are never recorded; there is a test that sends a canary
+string through a forward and fails if it appears in any column of any row.
+
 **Deny by default, with distinguishable reasons.** Every refusal carries a stable reason
 code. `target_connection_refused` is never reported as `policy_denied` — an operator must
 be able to tell *"you may not"* from *"it is down"* without reading logs.
@@ -214,14 +237,21 @@ half-closing a broken peer leaves it blocked forever on credit that will never a
 [ADR-0009](docs/decisions/0009-half-close-and-abort.md).
 
 **Dependencies have to earn their place.** Every one must survive the question *"why not
-the standard library?"*, and so far none have: the entire system today is stdlib, and
-that includes the Windows DPAPI binding and the multiplexer. Binaries are static, ~4 MB,
-`CGO_ENABLED=0`, and cross-compile to Linux, Windows, and ARM from any host.
+the standard library?"*. Exactly one has: `modernc.org/sqlite`, which holds control-plane
+state and the audit trail. An append-only trail queried across several dimensions is not
+something to hand-roll, and the alternative — a key-value store plus a log file — loses on
+the data that actually matters and cannot write a decision and its record in one
+transaction. See [ADR-0011](docs/decisions/0011-sqlite-not-key-value.md).
 
-That count will not stay at zero. A database arrives with the policy engine and audit
-trail, because correctness there is hard to write and easy to get subtly wrong — see
-[ADR-0011](docs/decisions/0011-sqlite-not-key-value.md). The rule is the property worth
-keeping, not the number.
+It is a pure-Go translation of SQLite rather than a cgo binding, which removes the
+memory-safety bug class and keeps `CGO_ENABLED=0`. Be clear about what it costs: one
+direct dependency, nine transitive ones, and by a wide margin the largest body of code in
+the build — none of which anyone here has read. That is the honest price of not
+hand-rolling an audit store.
+
+Everything else, including the multiplexer, the wire protocol, the grant encoding, and
+every Windows API binding, is the standard library. Binaries are static and cross-compile
+to Linux, Windows, and ARM from any host.
 
 ## Status
 
@@ -229,8 +259,9 @@ keeping, not the number.
 enrolled identity proved by certificate, and every stream requires a signed, expiring
 grant that the endpoint agent verifies for itself before it dials anything.
 
-What is missing is the record: there is no queryable audit trail yet, and grants cannot
-be revoked before they expire.
+Every decision is now recorded and every grant can be taken back before it expires,
+including from a session that is already running. What is still missing is end-to-end
+encryption: the relay terminates TLS on both sides and sees plaintext.
 
 | Capability | State |
 | ---------- | ----- |
@@ -255,10 +286,16 @@ be revoked before they expire.
 | Windows Service with restart-on-failure | working |
 | Windows Event Log for operational events | working |
 | PowerShell installer with ACL-protected state | working |
+| Per-session transfer cap (`max_bytes`) | working |
+| Operator sessions, bounded and revocable | working |
+| Queryable audit trail | working |
+| Grant revocation before expiry, including live streams | working |
+| Cascading revocation: identity to sessions to grants to streams | working |
+| SQLite control-plane state with numbered migrations | working |
 | End-to-end encryption between operator and agent | not implemented |
-| Operator login flow | not implemented |
-| Queryable audit trail | not implemented |
-| Grant revocation before expiry | not implemented |
+| Tamper-evident or externally shipped audit | not implemented |
+| Single sign-on for operators | not implemented |
+| Automatic certificate renewal | not implemented |
 | WFP leak guard | not implemented |
 | Native diagnostics library | not implemented |
 
@@ -284,8 +321,23 @@ Beyond the unimplemented work above, these hold by design:
 - **Scoping is per port, not per operation.** The system controls who reaches which
   resource for how long. What is possible once connected is defined by the service behind
   that port.
-- **Revocation takes effect on the next connection, not immediately.** A session already
-  running continues until it ends. Restarting the relay is currently the way to drop one.
+- **The audit trail is append-only in the software, not tamper-evident.** Nothing in the
+  code updates or deletes a row. Anyone with filesystem access to the database can still
+  edit it with a standard tool, and there is no hash chain, no signature, and no shipping
+  to an external sink. It is evidence against an operator, not against whoever runs the
+  control plane.
+- **A session is not a second authentication factor.** The certificate is the only
+  credential; a session is a bounded, revocable handle on top of it. It shortens the
+  window and groups activity for audit — it does not make a stolen certificate harder to
+  use.
+- **Revocation reaches live streams only on a relay in the same process as the control
+  plane.** That is the shipped topology, and it is what the `sar-server run` command
+  starts. A relay running as a separate process learns of a revocation on its next grant
+  check, which happens when a stream is opened — so a stream already joined continues
+  until it ends or the grant expires. Splitting the two is not supported yet.
+- **The control plane is a single node.** SQLite means one writer and one machine. There
+  is no replication and no failover; a lost database is a lost deployment unless it was
+  backed up.
 - **Certificates expire after thirty days and are not renewed automatically.**
   Re-enrolling is a manual step.
 - **Whoever hands over an enrollment code is trusted.** The code is single-use,
@@ -310,9 +362,12 @@ Rationale for each is in [docs/decisions/](docs/decisions/) — including
 
 ## Technology
 
-**Go** for the service lifecycle, networking, protocol, policy evaluation, and CLI.
-Standard library only — `crypto/tls`, `net`, `log/slog`. Every dependency has to survive
-the question *"why not the standard library?"*, and so far none have.
+**Go** for the service lifecycle, networking, protocol, policy evaluation, audit, and
+CLI. Almost entirely the standard library — `crypto/tls`, `net`, `log/slog`, `database/sql`.
+The single external dependency is **`modernc.org/sqlite`**, a pure-Go SQLite used for
+control-plane state and the audit trail; every dependency has to survive the question
+*"why not the standard library?"*, and that one does
+([ADR-0011](docs/decisions/0011-sqlite-not-key-value.md)).
 
 **A small C library** (`sardiag`, not yet written) will collect Windows adapter, route,
 DNS, and proxy state behind a stable `extern "C"` ABI, loaded dynamically so the agent
@@ -328,9 +383,19 @@ Authorization will be **Ed25519-signed grants** with a fixed claim set rather th
 because JWT's `alg` field is a decision a verifier can get wrong —
 [ADR-0003](docs/decisions/0003-ed25519-grants-not-jwt.md).
 
-**DPAPI is reached through the standard library**, not a third-party Windows binding.
-That keeps the dependency count at zero and rehearses the dynamic-loading technique the
-native diagnostics library will use.
+**DPAPI is reached through the standard library**, not a third-party Windows binding —
+about fifteen entry points called with `syscall`, each visible with its structure layout
+and error handling. It also rehearses the dynamic-loading technique the native diagnostics
+library will use. The same applies to the service control manager and the Event Log
+([ADR-0012](docs/decisions/0012-win32-through-stdlib.md)).
+
+**Control-plane state is SQLite**, with numbered migrations and an explicit refusal to
+start against a schema newer than the binary understands. Every statement is
+parameterised without exception: identifiers reach the control plane from certificates and
+request bodies, and string-built SQL is the one failure class this project would otherwise
+not have had at all. Key material never goes in the database — the authority key, device
+keys, and the grant signing key stay in `internal/keystore`, sealed with DPAPI on Windows,
+so a database compromise is not a key compromise.
 
 ## Trying it
 
@@ -380,6 +445,11 @@ go run ./testdata/fixtures/httpfixture.go -addr 127.0.0.1:8080
 # The endpoint agent. Dials out; never listens.
 ./bin/sar-agent run -resources resources.json
 
+# Open an operator session. The certificate authenticates it; the session is what
+# makes the work that follows revocable as a group and attributable in the audit
+# trail. connect opens one automatically if you skip this.
+./bin/sarctl login
+
 # The operator forward. Requests a grant, then carries traffic under it.
 ./bin/sarctl connect -device panel-lab-01 -resource res_diagnostics -listen 127.0.0.1:18080
 ```
@@ -408,6 +478,49 @@ and the agent records enforcing it:
                            target=127.0.0.1:8080 expires_in_s=1199
 ```
 
+**4. Ask the trail what happened.** Every decision above is a row, queryable by actor,
+device, resource, grant, or event:
+
+```sh
+./bin/sar-server audit
+```
+
+```
+TIME                 EVENT           ACTOR  DEVICE        RESOURCE         GRANT              REASON  DETAIL
+2026-08-21 20:12:08  stream.closed   maria  panel-lab-01  res_diagnostics  grn_00decae9a1...  ok      85B in / 145B out, 9ms
+2026-08-21 20:12:08  stream.opened   maria  panel-lab-01  res_diagnostics  grn_00decae9a1...  -       -
+2026-08-21 20:12:08  grant.created   maria  panel-lab-01  res_diagnostics  grn_00decae9a1...  -       policy pol_support
+2026-08-21 20:12:06  operator.login  maria  -             -                -                  -       from 127.0.0.1
+```
+
+`-denials` narrows it to refusals, which is usually the question worth asking:
+
+```sh
+./bin/sar-server audit -denials -since 24h
+./bin/sar-server audit -device panel-lab-01 -event stream.closed
+./bin/sar-server audit -events            # the closed set of event names
+```
+
+Payload bytes never appear here. Neither do tokens, keys, or grant signatures.
+
+**5. Take access back.** Revoking a grant drops the streams it opened, not just the next
+one:
+
+```sh
+./bin/sar-server grants -active
+./bin/sar-server grants -revoke grn_00decae9a1cb604d4a4a828f942b1e79
+# the operator's in-flight request is cut; the next is refused with grant_revoked
+```
+
+The same at session and identity scope, each cascading down:
+
+```sh
+./bin/sar-server sessions -active
+./bin/sar-server sessions -revoke ses_7a168801...   # ends the session and its grants
+./bin/sar-server revoke -operator maria             # ends their sessions and their grants
+./bin/sarctl logout                                 # the operator ending their own
+```
+
 To see the enforcement, ask for something no policy allows:
 
 ```sh
@@ -424,7 +537,8 @@ Or point things where they must not go:
 ./bin/sar-agent enroll -code <an already used code>   # refused: tokens are single use
 ```
 
-Revoke an identity and it is refused on its next connection:
+Revoke an identity and it is refused on its next connection, and the grants naming it
+are revoked immediately:
 
 ```sh
 ./bin/sar-server revoke -device panel-lab-01

@@ -49,6 +49,18 @@ type Config struct {
 	// setting.
 	GrantTTL time.Duration
 
+	// Session supplies the bearer token presented with each grant request.
+	//
+	// A function rather than a string because a forward can outlive a session: a
+	// support session lasts a shift, grants are refreshed every few minutes, and
+	// a token captured once at startup would stop working part way through
+	// without the forwarder being able to do anything about it. Called on each
+	// grant request, so the provider can renew.
+	//
+	// Optional. Without it grants are requested on the certificate alone, which a
+	// control plane may or may not accept.
+	Session func(ctx context.Context) (string, error)
+
 	KeepAlive   time.Duration
 	IdleTimeout time.Duration
 

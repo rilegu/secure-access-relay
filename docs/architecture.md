@@ -46,17 +46,19 @@ sar-agent --dial--> 127.0.0.1:8080   (the one approved resource)
 
 ## What is built today
 
-The diagram above is the target. The current build implements the data path and none of
-the security layers:
+The diagram above is the target. The current build implements every layer of it except
+end-to-end encryption:
 
 | Component | Today |
 | --------- | ----- |
-| `sar-agent` | runs as a Windows service with delayed auto-start and restart-on-failure. Enrolls, holds an outbound mTLS session, serves concurrent streams to one configured loopback target, reconnects on failure. No grant verification. |
-| `sar-server` | control plane (authority, enrollment, revocation) **and** relay (one listener for both roles, registry keyed by device, stream joining). No policy engine. |
-| `sarctl` | enrolls, opens one relay session carrying many streams. No login flow, no grant request, no audit query. |
+| `sar-agent` | runs as a Windows service with delayed auto-start and restart-on-failure. Enrolls, holds an outbound mTLS session, verifies every grant itself, resolves resource identifiers against its own allowlist, enforces expiry and byte budgets on running streams, reconnects on failure. |
+| `sar-server` | control plane (authority, enrollment, policy, grants, operator sessions, audit trail in SQLite) **and** relay (one listener for both roles, registry keyed by device, stream joining, revocation enforcement). |
+| `sarctl` | enrolls, opens a session, requests grants under it, and carries many streams over one relay session. |
 | Transport | **TLS 1.3, mutual, on every data-plane connection.** |
 | Identity | **from the certificate.** Enrolled, revocable, role-bound. |
-| Authorization | **signed grants.** Policy decides, the agent enforces. No audit trail yet. |
+| Authorization | **signed grants.** Policy decides, the agent enforces, the relay fails fast. |
+| Accountability | **queryable append-only audit trail**, written in the same transaction as the decision it records. |
+| Revocation | **immediate**, including streams already running. Cascades identity to sessions to grants to streams. |
 
 Enforced today:
 
@@ -75,16 +77,24 @@ Enforced today:
 - **Operational events reach the Windows Event Log** as well as the structured JSON log,
   so an administrator looking in the usual place finds something.
 
-The largest remaining gap is authorization: nothing decides *whether* a given operator
-may reach a given resource. Until that exists, the trust boundary table below describes
-the design rather than the running code.
+- **Every stream requires a signed grant**, verified independently by the agent against a
+  key it obtained at enrollment. The relay checks the same grant, but only to fail fast.
+- **Revocation reaches running streams.** The relay registers each joined stream against
+  the grant that authorized it and resets both ends when that grant is revoked — see
+  [ADR-0015](decisions/0015-revocation-reaches-live-streams.md).
+- **Every decision is recorded.** A grant and its audit event commit in one transaction,
+  so there is no state where access exists and nothing accounts for it.
+
+The largest remaining gap is **end-to-end encryption**. The relay terminates TLS on both
+sides and therefore sees plaintext; it is trusted for confidentiality today, and never for
+authorization.
 
 ## Trust boundaries
 
 | # | Boundary | Crossed by | Authenticated by |
 | - | -------- | ---------- | ---------------- |
-| 1 | Operator <-> control plane | HTTPS JSON API | operator identity (OIDC device code; dev credentials in `dev` profile) |
-| 2 | Operator <-> relay | TLS data-plane connection | short-lived session token bound to a grant |
+| 1 | Operator <-> control plane | HTTPS JSON API | mutual TLS, operator certificate, plus a session token on grant requests |
+| 2 | Operator <-> relay | TLS data-plane connection | mutual TLS, operator certificate; each stream carries a signed grant |
 | 3 | Agent <-> control plane | HTTPS JSON API | mutual TLS, device certificate |
 | 4 | Agent <-> relay | TLS data-plane connection | mutual TLS, device certificate |
 | 5 | Agent <-> local target | loopback TCP | none — the target is unmodified; the agent is the enforcement point |
@@ -98,10 +108,13 @@ reachable targets must be small, static, and explicitly configured.
 ## Data flow: an authorized session
 
 ```
-1. sarctl login                  -> control plane issues an operator session
-2. sarctl grants create          -> policy engine evaluates user x device x resource
+1. sarctl login                  -> certificate authenticates; control plane opens a
+                                    bounded, revocable operator session
+                                 -> audit: operator.login
+2. sarctl connect requests a grant, presenting the certificate and the session
+                                 -> policy engine evaluates user x device x resource
                                     -> issues Ed25519-signed grant, TTL <= 30m
-                                    -> audit: grant.created
+                                    -> grant row and audit: grant.created, one transaction
 3. sarctl connect                -> opens 127.0.0.1:18080 locally
                                  -> connects to relay, presents grant
 4. relay                         -> verifies grant signature and expiry
@@ -161,3 +174,30 @@ reachable.
 
 Directory ACLs restrict the tree to LocalSystem and Administrators. The unprivileged
 CLI reaches this state only through the named-pipe RPC, never by reading files.
+
+## State on the control plane
+
+```
+state/
+  ca.crt                the authority certificate
+  ca.key                the authority key, sealed through the keystore
+  grant-signing.key     the grant signing key, sealed through the keystore
+  policy.json           the rule set, read at startup
+  control.db            SQLite: identities, enrollment tokens, operator sessions,
+                        issued grants, and the audit trail
+  control.db-wal        write-ahead log; readers do not block the audit write
+```
+
+**No key material is in the database.** The authority key, device keys, and the grant
+signing key belong to `internal/keystore`, sealed with DPAPI on Windows. A database
+compromise must not be a key compromise, and encrypting the database would not change
+that — the key for it would have to live on the same machine.
+
+Nothing usable as a credential is stored in the clear. Enrollment tokens and operator
+session tokens are held as SHA-256 hashes, so a reader of this file learns that an
+enrollment is pending or a session is open — which is what an audit trail is for — and
+cannot use either.
+
+The schema version lives in SQLite's `user_version` pragma. A database written by a newer
+build is a startup failure, never a best-effort read: a control plane that half-understands
+its own authorization state is worse than one that refuses to start.

@@ -6,11 +6,20 @@
 package bridge
 
 import (
+	"errors"
 	"io"
 	"sync"
+	"sync/atomic"
 
 	"github.com/rilegu/secure-access-relay/internal/proto"
 )
+
+// ErrBudgetExhausted means a bridged pair reached its byte budget and was cut.
+//
+// A distinct error because it is not a failure: the limit did exactly what it
+// was configured to do, and an operator reading the record must be able to tell
+// "your transfer cap was reached" from "the connection broke".
+var ErrBudgetExhausted = errors.New("bridge: transfer budget exhausted")
 
 // bufferSize is the per-direction copy buffer. Sized to the frame limit so a
 // copy maps onto whole frames rather than repeatedly splitting them.
@@ -56,11 +65,29 @@ type resetter interface {
 // own upstream connection open with it. That is a hang rather than an error, and
 // it is much harder to diagnose.
 func Join(a, b io.ReadWriteCloser) (Stats, error) {
+	return JoinWithBudget(a, b, 0)
+}
+
+// JoinWithBudget is Join with a cap on total bytes carried in both directions.
+//
+// A budget of zero means unlimited, which is the default and must stay an
+// explicit choice in configuration rather than an accident.
+//
+// The cap is exact, not approximate: the final write is clamped to whatever
+// remains rather than being allowed to overshoot by up to a frame. A limit that
+// can be exceeded by 64 KiB is a limit that has to be explained, and this one is
+// cheap to make precise.
+//
+// Both directions share one budget. A grant authorizes a session, not a
+// direction, and a cap that applied per-direction would let twice as much
+// through as the number in the policy says.
+func JoinWithBudget(a, b io.ReadWriteCloser, maxBytes uint64) (Stats, error) {
 	var (
 		stats Stats
 		mu    sync.Mutex
 		first error
 		wg    sync.WaitGroup
+		spent atomic.Uint64
 	)
 
 	record := func(err error) {
@@ -81,16 +108,41 @@ func Join(a, b io.ReadWriteCloser) (Stats, error) {
 		reset(b, reason)
 	}
 
+	// take reserves up to want bytes of the shared budget, reporting how many are
+	// available. Zero means the budget is gone and the pair must be cut.
+	take := func(want int) int {
+		if maxBytes == 0 {
+			return want
+		}
+		for {
+			used := spent.Load()
+			if used >= maxBytes {
+				return 0
+			}
+			left := maxBytes - used
+			grant := uint64(want)
+			if grant > left {
+				grant = left
+			}
+			if spent.CompareAndSwap(used, used+grant) {
+				return int(grant)
+			}
+		}
+	}
+
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
-		n, rerr, werr := copyOneWay(b, a)
+		n, rerr, werr := copyOneWay(b, a, take)
 		mu.Lock()
 		stats.AToB = n
 		mu.Unlock()
 
 		switch {
+		case errors.Is(werr, ErrBudgetExhausted):
+			record(werr)
+			abort(proto.ReasonLimitBytesExceeded)
 		case werr != nil:
 			record(werr)
 			abort(proto.ReasonShutdown)
@@ -104,12 +156,15 @@ func Join(a, b io.ReadWriteCloser) (Stats, error) {
 
 	go func() {
 		defer wg.Done()
-		n, rerr, werr := copyOneWay(a, b)
+		n, rerr, werr := copyOneWay(a, b, take)
 		mu.Lock()
 		stats.BToA = n
 		mu.Unlock()
 
 		switch {
+		case errors.Is(werr, ErrBudgetExhausted):
+			record(werr)
+			abort(proto.ReasonLimitBytesExceeded)
 		case werr != nil:
 			record(werr)
 			abort(proto.ReasonShutdown)
@@ -136,11 +191,24 @@ func Join(a, b io.ReadWriteCloser) (Stats, error) {
 // io.Copy folds both into one error, which is not enough here: a read failure and
 // a write failure call for the same teardown, but a clean EOF calls for a very
 // different one, and only an explicit split makes that distinguishable.
-func copyOneWay(dst io.Writer, src io.Reader) (n int64, rerr, werr error) {
+// take reserves budget for a chunk about to be written. It returns how many of
+// the requested bytes may go, and zero when the budget is spent.
+func copyOneWay(dst io.Writer, src io.Reader, take func(int) int) (n int64, rerr, werr error) {
 	buf := make([]byte, bufferSize)
 	for {
 		nr, er := src.Read(buf)
 		if nr > 0 {
+			// The budget is claimed before the write, not counted after it, so the
+			// cap holds exactly rather than being discovered once it is already
+			// exceeded.
+			allowed := take(nr)
+			if allowed < nr {
+				if allowed > 0 {
+					nw, _ := dst.Write(buf[:allowed])
+					n += int64(nw)
+				}
+				return n, nil, ErrBudgetExhausted
+			}
 			nw, ew := dst.Write(buf[:nr])
 			n += int64(nw)
 			if ew != nil {

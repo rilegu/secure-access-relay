@@ -281,6 +281,11 @@ func (a *Agent) handleStream(ctx context.Context, st *mux.Stream) {
 	streamCtx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 
+	// The byte budget follows the same rule as the duration: whichever of the
+	// grant and the resource is stricter applies. Zero means unlimited on either
+	// side, so the smaller *non-zero* value wins rather than the smaller value.
+	budget := smallerLimit(grant.MaxBytes, resource.MaxBytes)
+
 	dialCtx, dialCancel := context.WithTimeout(streamCtx, proto.DialTimeout)
 	var d net.Dialer
 	target, err := d.DialContext(dialCtx, "tcp", resource.Target)
@@ -302,6 +307,7 @@ func (a *Agent) handleStream(ctx context.Context, st *mux.Stream) {
 	log.Info("stream authorized",
 		"target", resource.Target,
 		"expires_in_s", int(grant.Remaining(start).Seconds()),
+		"max_bytes", budget,
 	)
 
 	// Closing the stream when the deadline passes is what actually enforces
@@ -320,12 +326,17 @@ func (a *Agent) handleStream(ctx context.Context, st *mux.Stream) {
 		}
 	}()
 
-	stats, joinErr := bridge.Join(st, target)
+	stats, joinErr := bridge.JoinWithBudget(st, target, budget)
 
 	reason := proto.ReasonOK
 	switch {
 	case streamCtx.Err() == context.DeadlineExceeded:
 		reason = proto.ReasonGrantExpired
+	case errors.Is(joinErr, bridge.ErrBudgetExhausted):
+		// Not a failure. The cap did what it was configured to do, and the
+		// distinct code is what lets an operator tell that from a broken
+		// connection without reading logs.
+		reason = proto.ReasonLimitBytesExceeded
 	case joinErr != nil:
 		reason = proto.ReasonShutdown
 	}
@@ -336,6 +347,24 @@ func (a *Agent) handleStream(ctx context.Context, st *mux.Stream) {
 		"bytes_from_target", stats.BToA,
 		"duration_ms", time.Since(start).Milliseconds(),
 	)
+}
+
+// smallerLimit returns the stricter of two byte caps, where zero means no cap.
+//
+// Written out rather than using min, because zero is not the smallest value here
+// but the largest: a resource declaring no limit must not override a grant that
+// declares one, and the reverse.
+func smallerLimit(a, b uint64) uint64 {
+	switch {
+	case a == 0:
+		return b
+	case b == 0:
+		return a
+	case a < b:
+		return a
+	default:
+		return b
+	}
 }
 
 // serverName is the name the relay's certificate must match.

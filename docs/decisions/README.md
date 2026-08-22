@@ -6,6 +6,11 @@ context, the decision, and — most importantly — what was rejected and why.
 New ADRs get the next number. ADRs are never edited after acceptance; they are
 superseded by a later ADR that references them.
 
+The one exception is a record's **Implementation status** section, where a decision was
+accepted before the code existed. Those sections say when the decision came due and are
+updated when it does. The context, decision, and rejected-alternative sections are never
+touched.
+
 | # | Decision | Status |
 | - | -------- | ------ |
 | [0001](0001-relay-first-transport.md) | Relay-first transport; no NAT traversal in v1 | accepted |
@@ -21,3 +26,5 @@ superseded by a later ADR that references them.
 | [0011](0011-sqlite-not-key-value.md) | SQLite for control-plane state, not a key-value store | accepted |
 | [0012](0012-win32-through-stdlib.md) | Reach Win32 through the standard library | accepted |
 | [0013](0013-canonical-grant-encoding.md) | Grants are signed over a hand-written canonical encoding | accepted |
+| [0014](0014-operator-sessions-not-a-second-factor.md) | Operator sessions are a revocation handle, not a second factor | accepted |
+| [0015](0015-revocation-reaches-live-streams.md) | Revocation drops live streams from the relay, not the agent | accepted |

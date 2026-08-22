@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/rilegu/secure-access-relay/internal/ca"
+	"github.com/rilegu/secure-access-relay/internal/control/audit"
 	"github.com/rilegu/secure-access-relay/internal/control/grants"
 	"github.com/rilegu/secure-access-relay/internal/control/policy"
 	"github.com/rilegu/secure-access-relay/internal/proto"
@@ -30,6 +30,10 @@ type grantResponse struct {
 	GrantID   string `json:"grant_id"`
 	ExpiresAt string `json:"expires_at"`
 	PolicyID  string `json:"policy_id"`
+
+	// SessionID is the session the grant was issued under, echoed so an operator
+	// can quote it when asking for their own access to be cut short.
+	SessionID string `json:"session_id,omitempty"`
 }
 
 // handleGrant issues a grant to an authenticated operator.
@@ -44,27 +48,24 @@ func (s *Server) handleGrant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Client certificate required on this route. Enrollment cannot require one —
-	// a peer enrolls precisely because it has none — so the TLS configuration
-	// verifies a certificate if given and each route decides for itself.
-	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
-		s.log.Warn("grant request without a client certificate", "remote", r.RemoteAddr)
-		writeError(w, http.StatusUnauthorized, "a client certificate is required")
+	// A client certificate is required on this route. Enrollment cannot require
+	// one — a peer enrolls precisely because it has none — so the TLS
+	// configuration verifies a certificate if given and each route decides.
+	id, ok := s.authenticateOperator(w, r, audit.EventGrantDenied)
+	if !ok {
 		return
 	}
 
-	id, err := s.verify.VerifyEnrolled(r.TLS.PeerCertificates[0])
-	if err != nil {
-		s.log.Warn("grant request from an unrecognised identity", "remote", r.RemoteAddr, "error", err)
-		writeError(w, http.StatusForbidden, "not recognised")
-		return
-	}
-	if id.Role != ca.RoleOperator {
-		// A device certificate asking for a grant. Devices serve resources; they
-		// do not request access to them.
-		s.log.Warn("grant request from a non-operator", "identity", id.String())
-		writeError(w, http.StatusForbidden, "not an operator")
-		return
+	// A live session is required whenever the deployment has one configured. The
+	// session is not a second authentication factor; it is what makes the grant
+	// revocable as a group and attributable to a period of work.
+	var sessionID string
+	if s.login != nil {
+		sess, ok := s.requireSession(w, r, id)
+		if !ok {
+			return
+		}
+		sessionID = sess.SessionID
 	}
 
 	var req grantRequest
@@ -78,21 +79,24 @@ func (s *Server) handleGrant(w http.ResponseWriter, r *http.Request) {
 		ttl = proto.MaxGrantTTL
 	}
 
-	signed, decision, err := s.issuer.Issue(s.rules(), grants.Request{
+	signed, decision, err := s.issuer.Issue(r.Context(), s.rules(), grants.Request{
 		UserID:       id.ID,
 		DeviceID:     req.DeviceID,
 		ResourceID:   req.ResourceID,
 		RequestedTTL: ttl,
+		SessionID:    sessionID,
 	})
 	if err != nil {
 		if errors.Is(err, grants.ErrDenied) {
 			// Logged with everything needed to answer "why was I denied", because
 			// this is the record an operator will ask about. The caller is told
-			// only that it was denied.
+			// only that it was denied. The audit event is written by the issuer,
+			// inside the same call that made the decision.
 			s.log.Info("grant denied",
 				"user_id", id.ID,
 				"device_id", req.DeviceID,
 				"resource_id", req.ResourceID,
+				"session_id", sessionID,
 				"reason", decision.Reason.String(),
 			)
 			writeError(w, http.StatusForbidden, string(proto.ReasonPolicyDenied))
@@ -109,6 +113,7 @@ func (s *Server) handleGrant(w http.ResponseWriter, r *http.Request) {
 		"device_id", signed.DeviceID,
 		"resource_id", signed.ResourceID,
 		"policy_id", decision.PolicyID,
+		"session_id", sessionID,
 		"expires_at", signed.ExpiresAt.Format(time.RFC3339),
 	)
 
@@ -117,6 +122,7 @@ func (s *Server) handleGrant(w http.ResponseWriter, r *http.Request) {
 		GrantID:   signed.GrantID,
 		ExpiresAt: signed.ExpiresAt.UTC().Format(time.RFC3339),
 		PolicyID:  decision.PolicyID,
+		SessionID: sessionID,
 	})
 }
 

@@ -61,16 +61,24 @@ the agent is not merely exposing a LAN-reachable port.
 4.  install sar-agent on the Windows VM
 5.  agent enrolls: generates key, submits CSR, receives certificate
 6.  agent connects outbound, registers res_panel_diagnostics
-7.  sarctl login
-8.  sarctl devices list                  -> shows win11-lab-01 online
-9.  sarctl resources list --device ...   -> shows panel-diagnostics
-10. sarctl grants create --ttl 20m       -> grant issued
-11. sarctl connect --listen 127.0.0.1:18080
-12. curl http://127.0.0.1:18080/health   -> 200 from the fixture
-13. sarctl audit                         -> grant.created, stream.opened, stream.closed
+7.  sarctl login                         -> operator session opened, audited
+8.  sarctl connect --device win11-lab-01 --resource res_panel_diagnostics
+                                         -> grant requested under that session,
+                                            local listener on 127.0.0.1:18080
+9.  curl http://127.0.0.1:18080/health   -> 200 from the fixture
+10. sar-server audit                     -> operator.login, grant.created,
+                                            stream.opened, stream.closed with byte counts
+11. sar-server grants -revoke grn_...    -> in-flight stream dropped, next one refused
+12. sarctl logout                        -> session ended, its grants revoked
 ```
 
-Step 12 is the minimum end-to-end proof: bytes traverse the whole chain.
+Step 9 is the minimum end-to-end proof: bytes traverse the whole chain. Step 11 is the
+one that distinguishes this from a tunnel with a login — access already granted is taken
+back, not merely allowed to lapse.
+
+Listing subcommands (`devices list`, `resources list`) do not exist. An operator names a
+device and a resource they were told about out of band; discovery would hand anyone with
+a certificate a map of the estate, which is the opposite of deny-by-default.
 
 ## Mandatory deny tests
 
@@ -93,7 +101,7 @@ only.
 | D6 | Grant past `expires_at` | `grant_expired` | **implemented** |
 | D7 | Grant with future `issued_at` beyond skew | `grant_not_yet_valid` | **implemented** |
 | D8 | Grant for device A presented at device B | `grant_device_mismatch` | **implemented** |
-| D9 | Revoked grant | `grant_revoked` | not implemented |
+| D9 | Revoked grant | `grant_revoked` | **implemented** |
 | D10 | Resource ID absent from the local allowlist | `resource_unknown` | **implemented** |
 | D11 | Resource configured with a non-loopback target | agent refuses to start | **implemented** |
 | D12 | User with no matching policy requests a grant | `policy_denied` | **implemented** |
@@ -101,9 +109,24 @@ only.
 | D14 | Correct user and device, wrong resource | `policy_denied` | **implemented** |
 | D15 | Frame larger than `MAX_FRAME_PAYLOAD` | `limit_frame_too_large` | **implemented** |
 | D16 | More concurrent streams than the cap | `limit_streams_exceeded` | **implemented** |
-| D17 | Session exceeds `max_bytes` | `limit_bytes_exceeded` | not implemented |
+| D17 | Session exceeds `max_bytes` | `limit_bytes_exceeded` | **implemented** |
 | D18 | Unsupported protocol version in HELLO | `protocol_version_unsupported` | **implemented** |
 | D19 | Malformed, truncated, or garbage frame | `protocol_malformed_frame` | **implemented** |
+| D20 | Grant requested with no operator session | refused before policy is evaluated | **implemented** |
+| D21 | Session token presented with a different certificate | refused | **implemented** |
+| D22 | Grant requested under an ended session | refused | **implemented** |
+| D23 | Grant revoked while a stream is running | the stream is dropped, both ends | **implemented** |
+
+D23 deserves emphasis, because it is the one that is easy to pass for the wrong reason.
+The test starts a response that will not finish, waits until the relay reports a live
+stream rather than sleeping, and only then revokes. A revocation that arrived before the
+stream existed would prove nothing. It also asserts the live-stream register drains
+afterwards, because a register that kept the pair would report the wrong count to an
+administrator and try to reset a corpse on the next revocation.
+
+D17 is checked exactly, not approximately: the transfer is cut at the byte, not at the end
+of whichever frame crossed the limit. A cap that can be overshot by 64 KiB is a cap that
+has to be explained every time it is quoted.
 
 D11 deserves emphasis: it is a **startup** failure, not a runtime denial. A misconfigured
 allowlist must never produce a running agent.
@@ -188,7 +211,7 @@ looks like a real installation.
 | Disable and re-enable the NIC | Network-change detection triggers reconnect |
 | Reboot Windows | Service auto-starts and reconnects without manual action |
 | Kill agent process | SCM restarts it; WFP filters released by the OS |
-| Revoke grant during an active session | Session terminates promptly, audited |
+| Revoke grant during an active session | Stream dropped at both ends, audited — **implemented**, D23 |
 | Clock skew beyond tolerance | Grants denied, with a skew-specific reason |
 | Control plane down, agent already connected | Existing streams survive to expiry; **new streams denied** |
 | Fill disk on the endpoint | Logging degrades; access decisions stay correct |
