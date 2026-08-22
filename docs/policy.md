@@ -88,8 +88,15 @@ rather than after a round trip to a machine that was never going to accept it.
 
 | Point | Location | Checks |
 | ----- | -------- | ------ |
-| Fast-fail | relay | signature, expiry, device has a live session |
-| Authoritative | agent | signature, expiry, `device_id` matches self, `resource_id` in local allowlist, target is loopback, byte and duration budgets |
+| Fast-fail | relay | signature, expiry, revocation, device has a live session |
+| Authoritative | agent | signature, expiry, `device_id` matches self, `resource_id` in local allowlist, target is loopback, byte and duration budgets, **and that the peer proves possession of the key for the operator the grant names** |
+
+That last agent check is newer than the rest and closes a different kind of hole.
+The others establish that the grant is genuine; it establishes that the peer
+presenting it is the one it was issued to. Without it a relay could replay a
+grant it had carried for somebody else. It happens as part of the end-to-end
+session, before the local service is dialled — see
+[ADR-0018](decisions/0018-nested-tls-for-end-to-end-encryption.md).
 
 A compromised relay must not be able to open a stream. That property holds only because
 the agent's check does not trust anything the relay says.

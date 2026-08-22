@@ -302,8 +302,11 @@ the gaps are load-bearing enough to state rather than leave a reader to infer.
 | `PING` / `PONG` keepalive and idle timeout | implemented |
 | Multiple concurrent streams | implemented |
 | Reason codes | implemented |
-| TLS | **not implemented** |
+| Mutual TLS 1.3 on every data-plane connection | implemented |
+| End-to-end encryption inside the relayed stream | implemented — see [ADR-0018](decisions/0018-nested-tls-for-end-to-end-encryption.md) |
 | Grants and policy | implemented — see [ADR-0013](decisions/0013-canonical-grant-encoding.md) |
+| Grant revocation, including streams already running | implemented — see [ADR-0015](decisions/0015-revocation-reaches-live-streams.md) |
+| Unattended certificate renewal | implemented — see [ADR-0016](decisions/0016-renewal-is-pending-until-used.md) |
 
 **AUTH does not establish identity; the certificate does.** Every data-plane connection
 is mutual TLS, and the relay reads a peer's identity from a URI in its certificate before
@@ -324,8 +327,21 @@ already opened are dropped at both ends. What is still absent is tamper evidence
 trail is append-only in the software, not cryptographically chained, and anyone with
 filesystem access to the database can edit it.
 
-The gap that matters most now is **end-to-end encryption**. The relay terminates TLS on
-both sides, so it sees plaintext.
+Payload is end-to-end encrypted. Once a stream is joined, the operator and the agent
+complete a second TLS 1.3 handshake *inside* it, mutually authenticated with the
+certificates they were enrolled with, each requiring the identity the grant names. The
+relay copies those records without being able to read them, and required no changes to do
+so — it was already copying opaque bytes.
+
+The inner protocol is identified by the ALPN string `sar/e2ee/1`, which is also its
+version: an incompatible change becomes a new string rather than a silent
+misinterpretation. There is no negotiation and no fallback, because a negotiated security
+property is a downgrade target and both ends ship together.
+
+The agent completes the inner handshake **before** dialling the local service, so a
+failure delivers zero bytes to the target — the same rule every other denial follows.
+
+What the relay still sees is metadata, and it has to: the audit trail is built from it.
 
 Because a peer now states its role in `HELLO`, the relay serves both agents and operators
 on **one listener**. The separate ports used before this existed are gone.

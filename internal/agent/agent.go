@@ -11,6 +11,8 @@ import (
 
 	"github.com/rilegu/secure-access-relay/internal/backoff"
 	"github.com/rilegu/secure-access-relay/internal/bridge"
+	"github.com/rilegu/secure-access-relay/internal/ca"
+	"github.com/rilegu/secure-access-relay/internal/e2ee"
 	"github.com/rilegu/secure-access-relay/internal/identity"
 	"github.com/rilegu/secure-access-relay/internal/mux"
 	"github.com/rilegu/secure-access-relay/internal/netwatch"
@@ -496,6 +498,29 @@ func (a *Agent) handleStream(ctx context.Context, st *mux.Stream) {
 	// side, so the smaller *non-zero* value wins rather than the smaller value.
 	budget := smallerLimit(grant.MaxBytes, resource.MaxBytes)
 
+	// The inner session is established *before* the local service is dialled.
+	//
+	// Two reasons, and the second is the one that matters. A failed handshake
+	// must deliver zero bytes to the target, which is the property every denial
+	// in this system holds to. And the handshake is what proves the peer holds
+	// the operator key the grant names — until it completes, a valid grant only
+	// proves the control plane issued one, not that the far end is who obtained
+	// it. Dialling first would open a connection on the strength of a grant that
+	// anything with a copy could have presented.
+	secure, err := e2ee.Server(streamCtx, st, id, ca.Identity{
+		Role: ca.RoleOperator,
+		ID:   grant.UserID,
+	})
+	if err != nil {
+		// Reported as an authorization failure, because that is what it is: the
+		// far end could not prove it is the operator the grant names.
+		log.Warn("refusing stream: inner session not established",
+			"reason", proto.ReasonAuthFailed.String(), "error", err)
+		_ = st.Reset(proto.ReasonAuthFailed)
+		return
+	}
+	defer func() { _ = secure.Close() }()
+
 	dialCtx, dialCancel := context.WithTimeout(streamCtx, proto.DialTimeout)
 	var d net.Dialer
 	target, err := d.DialContext(dialCtx, "tcp", resource.Target)
@@ -518,11 +543,16 @@ func (a *Agent) handleStream(ctx context.Context, st *mux.Stream) {
 		"target", resource.Target,
 		"expires_in_s", int(grant.Remaining(start).Seconds()),
 		"max_bytes", budget,
+		"end_to_end_encrypted", true,
 	)
 
 	// Closing the stream when the deadline passes is what actually enforces
 	// expiry on a session already running. Without it, a grant would bound when a
 	// stream may *start* and nothing would bound how long it lasts.
+	//
+	// The raw stream is reset rather than the inner session, so the reason code
+	// reaches the relay and the operator. Tearing down the carrier takes the
+	// inner session with it.
 	done := make(chan struct{})
 	defer close(done)
 	go func() {
@@ -536,7 +566,9 @@ func (a *Agent) handleStream(ctx context.Context, st *mux.Stream) {
 		}
 	}()
 
-	stats, joinErr := bridge.JoinWithBudget(st, target, budget)
+	// The secure conn, not the raw stream: everything past this point is
+	// plaintext only here and at the operator. The relay copies records.
+	stats, joinErr := bridge.JoinWithBudget(secure, target, budget)
 
 	reason := proto.ReasonOK
 	switch {

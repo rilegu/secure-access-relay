@@ -177,11 +177,24 @@ address with an explicit port. Hostnames are rejected outright, so **no DNS look
 performed for a target** — a resource pinned to `127.0.0.1` cannot be moved by a poisoned
 answer. A misconfigured allowlist produces a failed startup, never a running agent.
 
-**The relay is untrusted for authorization.** It joins streams and forwards bytes
-opaquely, holds no signing key, and makes no access decision. It does check a grant, but
-only to fail fast — the endpoint agent verifies the same grant independently, against a
-key it obtained at enrollment, before it dials anything. A compromised relay can ask, and
-be refused.
+**The relay is untrusted, for authorization and for confidentiality both.** It joins
+streams and forwards bytes opaquely, holds no signing key, and makes no access decision.
+It does check a grant, but only to fail fast — the endpoint agent verifies the same grant
+independently, against a key it obtained at enrollment, before it dials anything. A
+compromised relay can ask, and be refused.
+
+**Operator and agent run their own encrypted session inside the relayed stream.** A second
+mutually authenticated TLS 1.3 session, using the certificates both ends already hold, so
+the relay copies records it cannot read. Each end verifies the identity the grant names:
+the operator requires the endpoint it was authorized for, and the agent requires the
+operator the grant was issued to.
+
+That second check closes a hole that had nothing to do with confidentiality. A grant
+travels through the relay, so a compromised relay could previously replay one it observed
+and open its own stream with it — the signature verified, the device matched, the user
+matched. The agent could prove the *grant* was genuine but not that the peer holding it
+was. It now has to prove possession of the operator's private key, which a relay does not
+have. See [ADR-0018](docs/decisions/0018-nested-tls-for-end-to-end-encryption.md).
 
 **An operator names a resource; the agent resolves it.** The grant carries a resource
 identifier, never an address. The agent looks it up in its own local allowlist and refuses
@@ -283,9 +296,10 @@ to Linux, Windows, and ARM from any host.
 enrolled identity proved by certificate, and every stream requires a signed, expiring
 grant that the endpoint agent verifies for itself before it dials anything.
 
-Every decision is now recorded and every grant can be taken back before it expires,
-including from a session that is already running. What is still missing is end-to-end
-encryption: the relay terminates TLS on both sides and sees plaintext.
+Every decision is recorded, every grant can be taken back before it expires including from
+a session already running, and the relay carries traffic it cannot read. It still sees
+metadata — who reached which device and resource, how much, for how long — because that
+metadata *is* the audit trail.
 
 | Capability | State |
 | ---------- | ----- |
@@ -320,7 +334,8 @@ encryption: the relay terminates TLS on both sides and sees plaintext.
 | Network-change detection (native on Windows, polled elsewhere) | working |
 | Unattended certificate renewal | working |
 | Audit retention, explicit and self-recording | working |
-| End-to-end encryption between operator and agent | not implemented |
+| End-to-end encryption between operator and agent | working |
+| Operator and agent authenticate each other directly | working |
 | Tamper-evident or externally shipped audit | not implemented |
 | Single sign-on for operators | not implemented |
 | WFP leak guard | not implemented |
@@ -343,8 +358,12 @@ Beyond the unimplemented work above, these hold by design:
   endpoint agent; stated rather than glossed over.
 - **A reachable coordination point is required.** Self-hosted, but it must exist. Two
   agents alone cannot connect across two NATed networks.
-- **The relay sees connection metadata**, and until end-to-end encryption lands it will
-  see plaintext once TLS terminates there.
+- **The relay sees connection metadata.** Who connected, to which device and resource,
+  how many bytes, for how long, and when. It cannot see payload — that is what the inner
+  session prevents — but traffic timing and volume are visible by construction, because a
+  relay that could not count bytes could not produce an audit trail. It can also refuse to
+  carry traffic at all: end-to-end encryption protects confidentiality and integrity, not
+  availability.
 - **Scoping is per port, not per operation.** The system controls who reaches which
   resource for how long. What is possible once connected is defined by the service behind
   that port.

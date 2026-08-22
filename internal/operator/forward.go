@@ -12,6 +12,8 @@ import (
 
 	"github.com/rilegu/secure-access-relay/internal/backoff"
 	"github.com/rilegu/secure-access-relay/internal/bridge"
+	"github.com/rilegu/secure-access-relay/internal/ca"
+	"github.com/rilegu/secure-access-relay/internal/e2ee"
 	"github.com/rilegu/secure-access-relay/internal/identity"
 	"github.com/rilegu/secure-access-relay/internal/mux"
 	"github.com/rilegu/secure-access-relay/internal/proto"
@@ -347,8 +349,27 @@ func (f *Forwarder) handle(ctx context.Context, local net.Conn) {
 		return
 	}
 
+	// The inner session, established before any of the client's bytes move.
+	//
+	// The expected identity is the device the grant names. That check is what
+	// stops a relay routing this stream to an endpoint the operator was not
+	// authorized for, or answering as one itself: a relay can send the stream
+	// anywhere, and it cannot produce that endpoint's key.
+	secure, err := e2ee.Client(ctx, st, f.cfg.Identity, ca.Identity{
+		Role: ca.RoleDevice,
+		ID:   f.cfg.DeviceID,
+	})
+	if err != nil {
+		log.Error("endpoint could not be authenticated end to end",
+			"device_id", f.cfg.DeviceID, "error", err)
+		_ = st.Reset(proto.ReasonAuthFailed)
+		_ = local.Close()
+		return
+	}
+	defer func() { _ = secure.Close() }()
+
 	start := time.Now()
-	stats, joinErr := bridge.Join(local, st)
+	stats, joinErr := bridge.Join(local, secure)
 
 	reason := proto.ReasonOK
 	if joinErr != nil {
@@ -356,6 +377,7 @@ func (f *Forwarder) handle(ctx context.Context, local net.Conn) {
 	}
 	log.Info("forward closed",
 		"stream_id", st.ID(),
+		"end_to_end_encrypted", true,
 		"reason", reason.String(),
 		"bytes_sent", stats.AToB,
 		"bytes_received", stats.BToA,
