@@ -153,6 +153,7 @@ matters finds two of them.
 ```
 device.enrolled       device.revoked        operator.enrolled     operator.revoked
 enroll.denied
+device.renewed        operator.renewed      renew.denied
 device.connected      device.disconnected
 operator.login        operator.login_denied operator.logout       operator.session_revoked
 grant.created         grant.denied          grant.revoked
@@ -161,6 +162,12 @@ admin.action
 ```
 
 `sar-server audit -events` prints this list.
+
+Renewal is recorded separately from enrollment because they are different
+events. An enrollment means somebody minted a token and handed it over; a renewal
+means an endpoint that was already trusted refreshed itself unattended.
+Conflating them would make a fleet that is working correctly look like continuous
+manual provisioning.
 
 Every event carries a monotonic sequence number, a timestamp, and whichever of `org_id`,
 actor role and identifier, `device_id`, `resource_id`, `grant_id`, and `session_id` apply.

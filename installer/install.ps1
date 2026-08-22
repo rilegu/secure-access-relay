@@ -25,20 +25,27 @@
 .PARAMETER RelayAddr
     Relay address the agent connects out to.
 
+.PARAMETER ControlAddr
+    Control-plane address. The agent uses it to renew its own certificate before
+    it expires. Omit it and the agent runs correctly until the certificate
+    lapses, then stops connecting and has to be re-enrolled by hand.
+
 .PARAMETER Target
     Local service to expose. Must be a loopback literal with an explicit port;
     the agent refuses to start otherwise.
 
 .EXAMPLE
-    .\install.ps1 -EnrollmentCode sar1.eyJ... -RelayAddr relay.example:443 -Target 127.0.0.1:8080
+    .\install.ps1 -EnrollmentCode sar1.eyJ... -RelayAddr relay.example:443 `
+                 -ControlAddr relay.example:17071 -Target 127.0.0.1:8080
 #>
 [CmdletBinding()]
 param(
     [string]$Source,
     [string]$EnrollmentCode,
-    [string]$RelayAddr = "127.0.0.1:17070",
-    [string]$Target    = "127.0.0.1:8080",
-    [string]$LogLevel  = "info"
+    [string]$RelayAddr   = "127.0.0.1:17070",
+    [string]$ControlAddr = "",
+    [string]$Target      = "127.0.0.1:8080",
+    [string]$LogLevel    = "info"
 )
 
 $ErrorActionPreference = 'Stop'
@@ -136,11 +143,26 @@ if ($EnrollmentCode) {
 # --- register the service ----------------------------------------------------
 
 Write-Step "Registering the service"
-& $InstalledExe service install `
-    -relay-addr $RelayAddr `
-    -state-dir  $StateDir `
-    -target     $Target `
-    -log-level  $LogLevel
+
+# The control-plane address is what lets the agent renew unattended. Without it
+# the service works until the certificate expires and then goes quiet, which is
+# the failure that is hardest to attribute - so it is passed when given and
+# warned about when not.
+$ServiceArgs = @(
+    '-relay-addr', $RelayAddr,
+    '-state-dir',  $StateDir,
+    '-target',     $Target,
+    '-log-level',  $LogLevel
+)
+if ($ControlAddr) {
+    $ServiceArgs += @('-control-addr', $ControlAddr)
+} else {
+    Write-Warning "No -ControlAddr given. This agent cannot renew its certificate and"
+    Write-Warning "will stop connecting when it expires. Re-run install.ps1 with"
+    Write-Warning "-ControlAddr to fix it."
+}
+
+& $InstalledExe service install @ServiceArgs
 if ($LASTEXITCODE -ne 0) { throw "Service registration failed." }
 
 if ($EnrollmentCode) {

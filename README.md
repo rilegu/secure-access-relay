@@ -228,6 +228,10 @@ Superseding at issue, the obvious implementation, has a small window with an
 unrecoverable consequence, which is the worst combination
 ([ADR-0016](docs/decisions/0016-renewal-is-pending-until-used.md)).
 
+Certificate lifetime is `sar-server run -cert-ttl` and defaults to thirty days;
+peers renew at ten days remaining. Setting it to a couple of minutes is how the
+whole cycle is exercised without waiting three weeks.
+
 **Every decision is written to a queryable audit trail.** Who connected, what they were
 granted and under which policy, every stream opened and refused with its reason code, and
 every finished stream's byte counts and duration. A grant and the record of that grant
@@ -478,8 +482,10 @@ make build
 # A local service to expose. Binds strictly to loopback.
 go run ./testdata/fixtures/httpfixture.go -addr 127.0.0.1:8080
 
-# The endpoint agent. Dials out; never listens.
-./bin/sar-agent run -resources resources.json
+# The endpoint agent. Dials out; never listens. The control-plane address is
+# what lets it renew its own certificate before the thirty days are up; without
+# it the agent works until the certificate lapses and then goes quiet.
+./bin/sar-agent run -resources resources.json -control-addr 127.0.0.1:17071
 
 # Open an operator session. The certificate authenticates it; the session is what
 # makes the work that follows revocable as a group and attributable in the audit
@@ -586,8 +592,13 @@ are revoked immediately:
 On the protected machine, from an elevated prompt:
 
 ```powershell
-.\installer\install.ps1 -EnrollmentCode sar1... -RelayAddr relay.example:443 -Target 127.0.0.1:8080
+.\installer\install.ps1 -EnrollmentCode sar1... -RelayAddr relay.example:443 `
+                        -ControlAddr relay.example:17071 -Target 127.0.0.1:8080
 ```
+
+`-ControlAddr` is what lets the service renew unattended. Leave it out and the
+installer warns: the agent will run correctly until its certificate expires and
+then stop connecting, which is the failure hardest to attribute after the fact.
 
 That copies the agent to Program Files, creates an ACL-protected state directory under
 ProgramData that Users cannot read, enrolls the device, and registers the service with

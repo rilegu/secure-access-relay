@@ -104,8 +104,18 @@ cmd/{sar-agent,sar-server,sarctl}/   entrypoints only, thin
 internal/
   proto/         frames, codec, handshake encoding, limits, reason codes
   mux/           many streams over one connection: flow control, keepalive
-  bridge/        bidirectional copy with half-close and abort semantics
+  bridge/        bidirectional copy with half-close, abort, and byte budget
   transport/     framed connection, TLS configuration, handshake completion
+  backoff/       exponential retry with full jitter, so a fleet does not stampede
+  netwatch/      reports local network changes; native on Windows, polled elsewhere
+
+Tuning knobs worth knowing, all of which have working defaults:
+
+  sar-agent  run -retry-interval / -max-retry-interval   first and final backoff ceiling
+  sar-agent  run -control-addr                           required for unattended renewal
+  sar-server run -cert-ttl                               certificate lifetime; short
+                                                         values make renewal observable
+  sar-server audit -stats / -prune-older-than / -confirm  trail size and retention
   ca/            development certificate authority: issues and parses identities
   keystore/      private key at rest; DPAPI on Windows, file permissions elsewhere
   identity/      a peer's own key, certificate, and trust anchor; enrollment client
