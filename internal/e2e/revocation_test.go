@@ -2,6 +2,9 @@ package e2e
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"testing"
 	"time"
@@ -119,9 +122,29 @@ func TestRevokedGrantIsRefusedByTheRelay(t *testing.T) {
 
 // TestRevocationDropsALiveStream is the property revocation exists for.
 //
-// A slow response is in flight when the grant is revoked. The stream must be
-// cut, not allowed to finish: an operator who is being cut off mid-transfer is
-// the whole reason revocation is not just "wait for expiry".
+// A response that never ends is in flight when the grant is revoked. The stream
+// must be cut: an operator being cut off mid-transfer is the whole reason
+// revocation is not just "wait for expiry".
+//
+// # Why this test is written so carefully
+//
+// The obvious version of it passes whether or not revocation works, in three
+// separate ways, and the first draft of this test managed all three at once:
+//
+//   - Asserting on the error from Get proves nothing. Get returns when the
+//     response *headers* arrive, and /slow flushes headers immediately, so Get
+//     succeeds long before any revocation could reach it.
+//   - Waiting for the relay to report a live stream proves nothing either: the
+//     warm-up request's stream is still registered for a moment after its
+//     response completes, so the wait returns immediately and revocation lands
+//     before the slow request has opened anything. The slow request is then
+//     refused at open with grant_revoked - a real denial, but the *fast-fail*
+//     path, not the one under test.
+//   - Any failure of the slow request then satisfies a bare "err != nil".
+//
+// So the test waits until the client has actually read a byte of the body. That
+// is the only signal that proves a stream exists, is joined end to end, and is
+// carrying data at the moment revocation is applied.
 func TestRevocationDropsALiveStream(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -133,6 +156,7 @@ func TestRevocationDropsALiveStream(t *testing.T) {
 	if err != nil {
 		t.Fatalf("warm-up request failed: %v", err)
 	}
+	_, _ = io.Copy(io.Discard, warm.Body)
 	_ = warm.Body.Close()
 
 	issued := activeGrants(t, h)
@@ -141,20 +165,55 @@ func TestRevocationDropsALiveStream(t *testing.T) {
 	}
 	grantID := issued[0].GrantID
 
-	// A request that will not finish on its own. The fixture holds the response
-	// open, so the stream is live and carrying nothing when revocation lands.
+	// A response with no end. Two channels: one says the body has started
+	// arriving, the other carries how it finished.
+	flowing := make(chan struct{})
 	errCh := make(chan error, 1)
+
 	go func() {
-		_, err := h.client(20 * time.Second).Get(h.ForwardURL + "/slow")
+		resp, err := h.client(30 * time.Second).Get(h.ForwardURL + "/slow")
+		if err != nil {
+			errCh <- fmt.Errorf("get: %w", err)
+			close(flowing)
+			return
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		// One byte of body is the proof that the whole chain is joined and
+		// carrying traffic. Headers are not: they are flushed before the first
+		// write and would arrive even if the stream died immediately after.
+		if _, err := io.ReadFull(resp.Body, make([]byte, 1)); err != nil {
+			errCh <- fmt.Errorf("first body byte: %w", err)
+			close(flowing)
+			return
+		}
+		close(flowing)
+
+		// Blocks until the stream is cut. A clean EOF would mean an endless
+		// response ended by itself, which means revocation did nothing.
+		_, err = io.Copy(io.Discard, resp.Body)
+		if err == nil {
+			err = errors.New("the response body ended cleanly")
+		}
 		errCh <- err
 	}()
 
-	// Wait until the relay is actually carrying the stream, rather than sleeping
-	// and hoping. A revocation that arrived before the stream existed would pass
-	// this test for the wrong reason.
-	waitFor(t, 5*time.Second, "a live stream on the relay", func() bool {
-		return h.Relay.LiveStreamCount() > 0
-	})
+	select {
+	case <-flowing:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the slow response never started arriving")
+	}
+
+	// If it already failed, revocation is not what is being measured.
+	select {
+	case err := <-errCh:
+		t.Fatalf("the request failed before the grant was revoked: %v", err)
+	default:
+	}
+
+	if n := h.Relay.LiveStreamCount(); n == 0 {
+		t.Fatal("the relay reports no live stream while a response is in flight")
+	}
 
 	if _, err := h.Dep.store.RevokeGrant(ctx, grantID, "revoked_by_admin", storage.AuditEvent{
 		Event:     audit.EventGrantRevoked,
@@ -168,9 +227,9 @@ func TestRevocationDropsALiveStream(t *testing.T) {
 	select {
 	case err := <-errCh:
 		if err == nil {
-			t.Fatal("a request in flight completed after its grant was revoked")
+			t.Fatal("a response in flight completed after its grant was revoked")
 		}
-	case <-time.After(10 * time.Second):
+	case <-time.After(15 * time.Second):
 		t.Fatal("revoking a grant did not drop the stream it authorized")
 	}
 

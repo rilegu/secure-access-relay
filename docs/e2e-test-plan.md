@@ -117,12 +117,27 @@ only.
 | D22 | Grant requested under an ended session | refused | **implemented** |
 | D23 | Grant revoked while a stream is running | the stream is dropped, both ends | **implemented** |
 
-D23 deserves emphasis, because it is the one that is easy to pass for the wrong reason.
-The test starts a response that will not finish, waits until the relay reports a live
-stream rather than sleeping, and only then revokes. A revocation that arrived before the
-stream existed would prove nothing. It also asserts the live-stream register drains
-afterwards, because a register that kept the pair would report the wrong count to an
-administrator and try to reset a corpse on the next revocation.
+D23 deserves emphasis, because it is the one that is easy to pass for the wrong reason —
+and the first version of it did, in three ways at once:
+
+- Asserting on the error from an HTTP `Get` proves nothing. `Get` returns when the
+  response *headers* arrive, and the endless-response fixture flushes headers before its
+  first write, so `Get` succeeds long before a revocation could reach it.
+- Waiting for the relay to report a live stream proves nothing either. The preceding
+  warm-up request's stream is still registered for a moment after its response completes,
+  so the wait returns immediately, the revocation lands before the slow request has opened
+  anything, and that request is then refused *at open* with `grant_revoked`. A real
+  denial — but the fast-fail path, not the one under test.
+- With both of those in place, any failure at all satisfies a bare `err != nil`.
+
+The test therefore waits until the client has read **a byte of the response body**. That
+is the only signal proving a stream exists, is joined end to end, and is carrying data at
+the moment revocation is applied. It then asserts the body read fails, and that the
+live-stream register drains — a register that kept the pair would report the wrong count
+to an administrator and try to reset a corpse on the next revocation.
+
+The check that this test is worth anything is to break the thing it covers: with the
+relay's `TerminateGrants` call removed it must fail, and it does.
 
 D17 is checked exactly, not approximately: the transfer is cut at the byte, not at the end
 of whichever frame crossed the limit. A cap that can be overshot by 64 KiB is a cap that

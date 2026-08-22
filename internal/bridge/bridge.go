@@ -191,6 +191,7 @@ func JoinWithBudget(a, b io.ReadWriteCloser, maxBytes uint64) (Stats, error) {
 // io.Copy folds both into one error, which is not enough here: a read failure and
 // a write failure call for the same teardown, but a clean EOF calls for a very
 // different one, and only an explicit split makes that distinguishable.
+//
 // take reserves budget for a chunk about to be written. It returns how many of
 // the requested bytes may go, and zero when the budget is spent.
 func copyOneWay(dst io.Writer, src io.Reader, take func(int) int) (n int64, rerr, werr error) {

@@ -383,9 +383,20 @@ func buildHarness(t *testing.T, opt options) *harness {
 		target = h.counter.addr
 	} else {
 		h.Fixture = httptest.NewServer(fixtureHandler())
-		t.Cleanup(h.Fixture.Close)
+		t.Cleanup(func() { closeFixture(h.Fixture) })
 		target = h.Fixture.Listener.Addr().String()
 	}
+
+	// Registered after the fixture, so LIFO runs it first: the chain is torn down
+	// before the service it talks to.
+	//
+	// httptest.Server.Close waits for every connection it accepted to go idle, and
+	// the only thing that can release the agent's connection to the fixture is the
+	// agent. Closing the fixture first meant a request still in flight — which is
+	// exactly what the mid-stream-close tests leave behind — blocked Close until
+	// the package timeout, turning a fast failure into a ten-minute hang with no
+	// useful message.
+	t.Cleanup(func() { stopChain(ctx, cancel, h) })
 	if opt.target != "" {
 		target = opt.target
 	}
@@ -593,9 +604,41 @@ func newCountingFixture(t *testing.T) *countingFixture {
 		f.n.Add(1)
 		inner.ServeHTTP(w, r)
 	}))
-	t.Cleanup(f.srv.Close)
+	t.Cleanup(func() { closeFixture(f.srv) })
 	f.addr = f.srv.Listener.Addr().String()
 	return f
+}
+
+// closeFixture shuts a fixture down without the risk of waiting forever.
+//
+// CloseClientConnections first, because Close blocks until every accepted
+// connection is idle and a test that deliberately abandons a response mid-stream
+// leaves one that is not. Without this a teardown races the chain's own cleanup,
+// and losing that race costs the whole package's timeout rather than one test.
+func closeFixture(srv *httptest.Server) {
+	srv.CloseClientConnections()
+	srv.Close()
+}
+
+// stopChain cancels the harness context and waits for the components to let go
+// of their sockets.
+//
+// Cancelling is not instantaneous: the agent closes a target connection from the
+// goroutine watching its stream deadline, and the fixture cannot finish closing
+// until that has happened. Waiting here rather than in httptest's Close means a
+// component that genuinely leaks a connection fails a bounded wait with a clear
+// message instead of hanging the package.
+func stopChain(ctx context.Context, cancel context.CancelFunc, h *harness) {
+	cancel()
+	<-ctx.Done()
+
+	if h.Forwarder == nil {
+		return
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for h.Forwarder.Active() > 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 func (f *countingFixture) hits() int32 { return f.n.Load() }
