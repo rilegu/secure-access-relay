@@ -18,7 +18,7 @@ endpoint.
 |  - local listener       |                      |  - resource allowlist           |
 |    127.0.0.1:18080      |                      |  - local grant verification     |
 +-----------+-------------+                      |  - audit + Event Log            |
-            |                                    |  - WFP leak guard (planned)     |
+            |                                    |  - sardiag.dll (optional)       |
             | outbound TLS 1.3                   +----------+----------------------+
             |                                               | outbound mTLS
             v                                               v

@@ -228,6 +228,29 @@ middle can read, so every golden-path test passes either way — only a test tha
 inspects what the relay handled can tell the difference. Verified by sabotage: sending
 the canary outside the inner session makes it fail.
 
+**Native ABI**
+
+The boundary between a C library and a pure-Go agent is where a mistake is a heap
+overflow rather than a wrong answer, so the tests are split by what they can
+catch:
+
+- C tests, run on every platform CI builds: exact-fit, one byte short, and
+  **every prefix** from zero to the required size, each with guard bytes on both
+  sides of the output buffer. A test that only checked the returned length would
+  not notice a write past the end, which is the bug that matters.
+- Number formatting at the edges, including `INT64_MIN` — the value that makes
+  the obvious implementation negate in signed space and invoke undefined
+  behaviour.
+- UTF-16 to UTF-8 conversion, including unpaired surrogates, which must become
+  U+FFFD rather than sequences a strict decoder rejects.
+- Go tests against a locally built library: it loads, the ABI version matches,
+  a snapshot decodes, unknown JSON fields are ignored, an impossible interface
+  reports not-found, and an **unsigned** library is refused when verification is
+  on.
+
+The last of those is the one that proves `WinVerifyTrust` is wired up rather than
+merely called: the locally built library is signed by nobody, so it must fail.
+
 **WFP**
 
 - Filter blocks the intended demo process or destination

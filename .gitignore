@@ -87,3 +87,8 @@ support-bundle*/
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# Build output for the optional native library. The source is tracked; the DLL
+# and test binary are not, because they are platform- and compiler-specific and
+# a checked-in binary is one nobody rebuilds.
+native/sardiag/build/

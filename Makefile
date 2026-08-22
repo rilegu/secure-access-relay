@@ -5,7 +5,7 @@ PKGS     := ./...
 
 export CGO_ENABLED := 0
 
-.PHONY: all build test test-race lint vet fmt tidy clean integration win-integration
+.PHONY: all build test test-race lint vet fmt tidy clean integration win-integration native
 
 all: lint test test-race build
 
@@ -28,6 +28,12 @@ integration:
 ## Windows-only: SCM, named pipes, DPAPI, WFP, installer. Disposable VM only.
 win-integration:
 	$(GO) test -tags=windows_integration -count=1 $(PKGS)
+
+# The optional C diagnostics library. Not part of `build`: it needs a C
+# compiler, the Go binaries do not, and a checkout without one must still build
+# and test everything else.
+native:
+	bash native/sardiag/build.sh
 
 vet:
 	$(GO) vet $(PKGS)
