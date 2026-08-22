@@ -13,7 +13,7 @@ endpoint.
 | Operator workstation    |                      | Windows endpoint                |
 |                         |                      |                                 |
 |  sarctl                 |                      |  sar-agent (Windows Service)    |
-|  - OIDC / dev login     |                      |  - device key (DPAPI protected) |
+|  - login: cert, session |                      |  - device key (DPAPI protected) |
 |  - grant request        |                      |  - outbound mTLS, never listens |
 |  - local listener       |                      |  - resource allowlist           |
 |    127.0.0.1:18080      |                      |  - local grant verification     |
@@ -35,8 +35,22 @@ endpoint.
        +----------------------------------------------------------+
                                    |
                                    v
-                        storage (JSON today, SQLite next)
+            storage (SQLite: identities, tokens, sessions, grants, audit)
 ```
+
+The two outbound TLS connections above are what the relay terminates. Inside the
+stream it joins between them runs a **third** TLS session, mutually authenticated
+between `sarctl` and `sar-agent` on their enrolled certificates:
+
+```
+sarctl  ==[ inner TLS 1.3, operator <-> agent ]==>  sar-agent
+   \____ outer TLS to relay ____/ \____ outer TLS to relay ____/
+```
+
+The relay copies the inner records without being able to read them, and each end
+verifies the identity the grant names — so the relay can neither read the traffic
+nor substitute itself for either party. See
+[ADR-0018](decisions/0018-nested-tls-for-end-to-end-encryption.md).
 
 The endpoint's approved service is reached only as `127.0.0.1:<port>`:
 
@@ -90,9 +104,14 @@ Enforced today:
   and a renewal that fails part way through leaves the endpoint using the certificate it
   already had — see [ADR-0016](decisions/0016-renewal-is-pending-until-used.md).
 
-The largest remaining gap is **end-to-end encryption**. The relay terminates TLS on both
-sides and therefore sees plaintext; it is trusted for confidentiality today, and never for
-authorization.
+- **The relay cannot read what it carries.** A second mutually authenticated TLS session
+  runs between operator and agent inside the relayed stream. Each end verifies the
+  identity the grant names, which also makes a grant captured by the relay useless to it —
+  see [ADR-0018](decisions/0018-nested-tls-for-end-to-end-encryption.md).
+
+What the relay still sees is metadata: who, which device, which resource, how much, how
+long. That is unavoidable in this architecture and is also what the audit trail is made
+of. It can also refuse to carry traffic, which no relay-based design can prevent.
 
 ## Trust boundaries
 
@@ -100,6 +119,7 @@ authorization.
 | - | -------- | ---------- | ---------------- |
 | 1 | Operator <-> control plane | HTTPS JSON API | mutual TLS, operator certificate, plus a session token on grant requests |
 | 2 | Operator <-> relay | TLS data-plane connection | mutual TLS, operator certificate; each stream carries a signed grant |
+| 2b | Operator <-> agent | nested TLS **inside** the relayed stream | mutual TLS on both peers' enrolled certificates, each verifying the identity the grant names |
 | 3 | Agent <-> control plane | HTTPS JSON API | mutual TLS, device certificate |
 | 4 | Agent <-> relay | TLS data-plane connection | mutual TLS, device certificate |
 | 5 | Agent <-> local target | loopback TCP | none — the target is unmodified; the agent is the enforcement point |

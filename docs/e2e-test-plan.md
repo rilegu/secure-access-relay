@@ -116,6 +116,10 @@ only.
 | D21 | Session token presented with a different certificate | refused | **implemented** |
 | D22 | Grant requested under an ended session | refused | **implemented** |
 | D23 | Grant revoked while a stream is running | the stream is dropped, both ends | **implemented** |
+| D24 | Relay routes a stream to an endpoint the grant does not name | the operator refuses it | **implemented** |
+| D25 | Peer presents a grant it did not obtain | the agent refuses before dialling | **implemented** |
+| D26 | Inner session attempted with no client certificate | the agent refuses | **implemented** |
+| D27 | Certificate from a different authority | refused at the inner handshake | **implemented** |
 
 D23 deserves emphasis, because it is the one that is easy to pass for the wrong reason —
 and the first version of it did, in three ways at once:
@@ -209,6 +213,20 @@ looks like a real installation.
 
 - Copying the state directory to another machine yields an unusable key (DPAPI)
 - Key never appears in logs, the support bundle, or process arguments
+
+**End-to-end encryption**
+
+- The relay, modelled as a copier that reads every byte in both directions, never
+  observes a canary string sent either way
+- An operator refuses an endpoint whose certificate is not the device the grant names
+- An agent refuses a peer whose certificate is not the operator the grant names
+- The inner handshake completes **before** the local service is dialled, so a refusal
+  delivers zero bytes to the target
+
+The first of those is the one worth the effort. Forwarding works whether or not the
+middle can read, so every golden-path test passes either way — only a test that
+inspects what the relay handled can tell the difference. Verified by sabotage: sending
+the canary outside the inner session makes it fail.
 
 **WFP**
 

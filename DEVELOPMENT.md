@@ -12,8 +12,11 @@ and the code can be read, not worked on collectively. Pull requests will not be 
 Violating any of these is a bug, not a tradeoff. Enforce them in review.
 
 1. **Deny by default.** Every denial carries an explicit machine-readable reason code.
-2. **The relay never makes authorization decisions.** It pairs already-authorized
-   streams. The agent verifies the signed grant locally before dialing anything.
+2. **The relay never makes authorization decisions, and never sees payload.** It pairs
+   already-authorized streams. The agent verifies the signed grant locally before dialing
+   anything, and a nested TLS session between operator and agent means the relay copies
+   records it cannot read. It must never be given a way to decrypt, inspect, or
+   downgrade that session.
 3. **The control plane never carries payload traffic.**
 4. **Resource targets are loopback-only in v1.** No arbitrary LAN proxy, ever, by accident.
 5. **Grants are short-lived and signed** (Ed25519) over
@@ -106,8 +109,15 @@ internal/
   mux/           many streams over one connection: flow control, keepalive
   bridge/        bidirectional copy with half-close, abort, and byte budget
   transport/     framed connection, TLS configuration, handshake completion
+  e2ee/          nested TLS between operator and agent; the relay carries ciphertext
   backoff/       exponential retry with full jitter, so a fleet does not stampede
   netwatch/      reports local network changes; native on Windows, polled elsewhere
+
+Every command's full flag set is in its `-h`. Documented here and in the README
+are only the flags that encode a decision — the ones where the default is a
+choice somebody might need to disagree with. Operational plumbing such as
+`-state-dir`, `-log-level`, and `-max-streams` is deliberately left to `-h`
+rather than duplicated into prose that will drift.
 
 Tuning knobs worth knowing, all of which have working defaults:
 
