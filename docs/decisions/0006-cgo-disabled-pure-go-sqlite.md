@@ -23,25 +23,23 @@ a few hundred rows.
 
 ## Implementation status
 
-The `CGO_ENABLED=0` half of this decision is enforced today, everywhere.
+**Both halves are implemented.** `CGO_ENABLED=0` is enforced in the Makefile, the
+PowerShell task runner, and CI. `internal/storage` is SQLite through `modernc.org/sqlite`,
+holding identities, enrollment tokens, operator sessions, grants, and the audit trail,
+with numbered migrations and parameterised statements throughout.
 
-The storage half is **not yet implemented**. `internal/storage` is currently a
-mutex-guarded JSON file written atomically, with no database and no interfaces. It holds
-tens of records — enrolled identities and enrollment tokens — and needs exactly one
-transactional operation, single-use token consumption, which one mutex provides.
+It came due exactly where this record predicted: with the audit trail, which is
+append-only and unbounded and could not have been a rewritten JSON file. The
+zero-dependency property ended when it landed, which was the anticipated cost.
 
-That is adequate for the current data and inadequate for what comes next:
+An existing `control.json` from the previous store is imported on first open, so an
+upgraded deployment does not silently lose the identities it had enrolled.
 
-- Every mutation rewrites the whole file. Fine for tens of records; unworkable for
-  thousands.
-- There are no queries, no indexes, and no partial reads.
-- **The audit trail cannot be a rewritten file at all.** It is append-only and grows
-  without bound, which is the opposite of what this store does.
-
-So the decision recorded here stands and is simply not due yet. It becomes due with the
-policy engine and the audit trail, where the query patterns justify a database. Adopting
-it will end this project's zero-dependency property, which is a real cost and is the
-reason it has not been paid early.
+The interfaces this record mentions were not built. Storage is a concrete `*storage.Store`
+rather than a set of interfaces with one implementation: the relay and the control plane
+already communicate through narrow interfaces they define themselves, and adding a second
+abstraction for a Postgres backend nobody has asked for would be scaffolding for an
+imagined future. It is a mechanical change if that future arrives.
 
 ## Consequences
 

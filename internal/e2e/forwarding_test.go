@@ -473,13 +473,15 @@ func TestManyAgentsAndOperators(t *testing.T) {
 	// One operator per device, each with its own enrolled identity.
 	forwards := make(map[string]string, len(devices))
 	for _, id := range devices {
+		operatorID := dep.enrollIdentity(ca.RoleOperator, "usr_"+id)
 		f, err := operator.New(operator.Config{
 			RelayAddr:   relaySrv.Addr(),
 			ControlAddr: dep.controlAddr,
-			Identity:    dep.enrollIdentity(ca.RoleOperator, "usr_"+id),
+			Identity:    operatorID,
 			ListenAddr:  "127.0.0.1:0",
 			DeviceID:    id,
 			Resource:    testResourceID,
+			Session:     dep.sessionTokenFor(operatorID),
 			Logger:      log,
 		})
 		if err != nil {
@@ -542,13 +544,15 @@ func TestUnknownDeviceRefused(t *testing.T) {
 	dep.startControlPlane(ctx)
 	relaySrv := dep.startRelay(ctx, 16)
 
+	lostOperator := dep.enrollIdentity(ca.RoleOperator, "usr_lost")
 	f, err := operator.New(operator.Config{
 		RelayAddr:   relaySrv.Addr(),
 		ControlAddr: dep.controlAddr,
-		Identity:    dep.enrollIdentity(ca.RoleOperator, "usr_lost"),
+		Identity:    lostOperator,
 		ListenAddr:  "127.0.0.1:0",
 		DeviceID:    "dev_does_not_exist",
 		Resource:    testResourceID,
+		Session:     dep.sessionTokenFor(lostOperator),
 		Logger:      discardLogger(),
 	})
 	if err != nil {

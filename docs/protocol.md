@@ -188,19 +188,41 @@ operator's ability to distinguish "you may not" from "it is down."
 
 ## Control-plane API (sketch)
 
+Implemented:
+
 ```
-POST   /v1/enroll                    single-use token, CSR, returns device certificate
-GET    /v1/devices                   operator: list enrolled devices
-GET    /v1/devices/{id}/resources    operator: list resources on a device
-POST   /v1/grants                    operator: request a grant (policy evaluated here)
-DELETE /v1/grants/{id}               operator/admin: revoke
-GET    /v1/audit                     operator/admin: query audit events
-GET    /healthz  /readyz             liveness and readiness
+POST   /v1/enroll     single-use token, CSR, returns a certificate. No client
+                      certificate required — a peer enrolls precisely because it
+                      has none, so the listener verifies one if given and each
+                      route decides for itself.
+POST   /v1/login      operator: open a session. Client certificate required.
+POST   /v1/logout     operator: end their own session and the grants under it.
+POST   /v1/grants     operator: request a grant. Client certificate *and* a live
+                      session token required; policy is evaluated here.
+GET    /healthz       liveness
 ```
 
-Agent endpoints require mutual TLS with a device certificate. Operator endpoints require
-an operator session. No endpoint accepts a target address; the operator names a
-`resource_id` and nothing else.
+The session token travels as `Authorization: Bearer sar_ses_...`. A header rather than a
+cookie: this is an API between two command-line tools, and a cookie would bring same-site
+and CSRF questions to a client that has no browser and no ambient authority to confuse.
+
+**No endpoint accepts a target address.** The operator names a `resource_id` and nothing
+else; the agent resolves it against its own allowlist.
+
+Administration — revoking grants and sessions, querying the audit trail — is done with the
+`sar-server` CLI against the control-plane database directly, not over HTTP. There is no
+remote admin API, so an operator certificate cannot reach administrative functions at all.
+
+Deliberately absent, and not merely unbuilt:
+
+```
+GET    /v1/devices                   listing every enrolled device
+GET    /v1/devices/{id}/resources    listing what a device serves
+```
+
+Discovery would hand anyone holding an operator certificate a map of the estate. An
+operator names a device and a resource they were told about out of band, which is what
+deny-by-default means applied to knowledge as well as access.
 
 ## Grant format
 
@@ -293,9 +315,14 @@ Authorization now exists: a stream carries a signed grant in its `OPEN_STREAM` p
 and the endpoint agent verifies it before dialing. The grant names a resource, never an
 address — the agent resolves the identifier against its own allowlist.
 
-The gap that matters most now is the **record**. Every decision is logged with the
-identifiers needed to reconstruct it, but there is no queryable append-only audit trail,
-nothing is tamper-evident, and a grant cannot be revoked before it expires.
+Every decision is now recorded in a queryable append-only audit trail, and a grant can be
+revoked before it expires — a revoked grant is refused by the relay and the streams it
+already opened are dropped at both ends. What is still absent is tamper evidence: the
+trail is append-only in the software, not cryptographically chained, and anyone with
+filesystem access to the database can edit it.
+
+The gap that matters most now is **end-to-end encryption**. The relay terminates TLS on
+both sides, so it sees plaintext.
 
 Because a peer now states its role in `HELLO`, the relay serves both agents and operators
 on **one listener**. The separate ports used before this existed are gone.

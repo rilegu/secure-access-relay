@@ -21,11 +21,21 @@ Violating any of these is a bug, not a tradeoff. Enforce them in review.
    Max TTL 30 minutes.
 6. **On control-plane or authorization failure: deny new streams.** A failure must never
    widen access.
-7. **Never log** secrets, bearer tokens, private keys, grant signatures, or payload bytes.
+7. **Never log or record** secrets, bearer tokens, private keys, grant signatures, or
+   payload bytes. This covers the audit trail as much as stdout: the trail records that
+   access happened and under what authority, never the traffic itself.
 8. **No credentials in** the repository, CLI flags, installer arguments, environment
    dumps, or logs.
 9. **`CGO_ENABLED=0` for all Go binaries.** The native library is loaded dynamically at
    runtime, never linked at build time.
+10. **Every SQL statement is parameterised.** A caller's value is never concatenated into
+    statement text. The two places SQL is assembled — audit and grant filters — build
+    clauses from this repository's own string literals and bind every value. Identifiers
+    reach the control plane from certificates and request bodies, and a query language is
+    the one failure class this project would otherwise not have had at all.
+11. **The audit trail is append-only.** No `UPDATE`, no `DELETE`, ever, on
+    `audit_events`. A decision and the record of that decision commit in one transaction:
+    if the record cannot be written, the access is not granted.
 
 ## Stable IDs
 
@@ -48,16 +58,23 @@ were rejected and why.
 - **The library is loaded dynamically** via `golang.org/x/sys/windows` LazyDLL, **not
   cgo**. This keeps the agent pure Go, keeps the library optional at runtime, and keeps
   cross-compilation clean.
-- **Storage today:** a mutex-guarded JSON file written atomically, in `internal/storage`.
-  It holds tens of records and needs single-use token consumption to be atomic, which one
-  mutex provides with no dependency. It rewrites the whole file on every mutation, so it
-  does not scale and cannot hold an audit trail.
-- **Storage next:** `modernc.org/sqlite` — pure Go, never `mattn/go-sqlite3`, which needs
-  cgo and would cost static binaries and ARM cross-compilation. It arrives with the policy
-  engine and audit trail. See [ADR-0011](docs/decisions/0011-sqlite-not-key-value.md) for
-  why a relational database rather than an embedded key-value store, and what that costs.
-  When it lands: parameterised statements without exception, and an unrecognised schema
-  version is a startup failure rather than a best-effort read.
+- **Storage today:** SQLite through `modernc.org/sqlite`, in `internal/storage`. Numbered
+  migrations in `migrate.go`; the version lives in SQLite's `user_version` pragma and a
+  database newer than the binary is a startup failure, never a best-effort read. Every
+  statement is parameterised — no exceptions, and the one place an integer is formatted
+  into SQL is the `PRAGMA user_version` bump, which takes a compile-time loop counter.
+  WAL mode, so the audit write on the authorization hot path does not block readers.
+  Pure Go, never `mattn/go-sqlite3`, which needs cgo and would cost static binaries and
+  ARM cross-compilation. See [ADR-0011](docs/decisions/0011-sqlite-not-key-value.md) for
+  why a relational database rather than an embedded key-value store, and what it costs.
+- **Storage before this** was a mutex-guarded JSON file, adequate for tens of records and
+  unable to hold an append-only audit trail. `Store.ImportLegacyJSON` migrates an existing
+  `control.json` on first open, so an upgraded deployment does not lose its enrolled
+  identities — losing them would leave every device holding a certificate the control
+  plane no longer recognises, with no symptom but endpoints that stop connecting.
+- **Key material never goes in the database.** The authority key, device keys, and the
+  grant signing key belong to `internal/keystore`, sealed with DPAPI on Windows. A
+  database compromise must not be a key compromise.
 - **Two planes, two protocols:**
   - Control API: plain JSON over HTTPS. Curl-able and easy to document.
   - Data plane: hand-rolled binary framing in `internal/proto`. Not gRPC, not yamux —
@@ -67,8 +84,9 @@ were rejected and why.
 - **CLI:** the standard library's `flag`, with hand-written subcommand dispatch. Three
   binaries with a handful of subcommands do not justify a framework; this is the rule
   below applied to a case where it was tempting not to.
-- Keep the dependency list short and defensible. Every dependency should survive the
-  question "why not the standard library?"
+- Keep the dependency list short and defensible. Every dependency must survive the
+  question "why not the standard library?" Exactly one has: `modernc.org/sqlite`. Adding
+  a second needs an ADR, not a judgement call in a pull request.
 
 ## Layout
 
@@ -85,8 +103,8 @@ internal/
   agent/         endpoint runtime: session, target validation, stream handling
   operator/      operator-side forwarder: local listener, one session, many streams
   relay/         relay server; sessions/ (registry) authorization/
-  control/       enrollment/ httpapi/ policy/ grants/ ... resources/ audit/
-  storage/       enrolled identities and enrollment tokens
+  control/       enrollment/ httpapi/ policy/ grants/ login/ audit/ resources/
+  storage/       SQLite: identities, tokens, sessions, grants, audit; migrations
   config/ logging/
   e2e/           every component wired together in one process
   winsvc/        Windows service: SCM dispatcher, install, start, stop, status

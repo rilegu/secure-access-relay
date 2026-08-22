@@ -98,41 +98,102 @@ the agent's check does not trust anything the relay says.
 
 | Trigger | Effect | Status |
 | ------- | ------ | ------ |
-| Grant revoked | Relay drops matching live streams; agent drops on next control-plane sync | not implemented |
-| Device or operator revoked | Refused at the next connection | **implemented** |
-| Device or operator revoked, session already running | Session terminated | **not implemented** |
+| Grant revoked | Refused at the relay; live streams under it dropped at both ends | **implemented** |
+| Operator session ended | The session's grants revoked, their streams dropped | **implemented** |
+| Operator revoked | Their sessions ended, their grants revoked, their streams dropped | **implemented** |
+| Device revoked | Refused at its next connection; grants naming it revoked | **implemented** |
 | Re-enrollment supersedes a certificate | Previous certificate refused | **implemented** |
-| User disabled | All that user's grants revoked | not implemented |
+| Device or operator revoked, data-plane session already running | Session terminated | not implemented |
 | Policy deleted | Existing grants remain valid until expiry, bounded by the 30-minute max TTL | not implemented |
 
-Short TTLs are the primary revocation mechanism. Explicit revocation is the fast path,
-not the only path.
+Short TTLs remain the mechanism that works when nothing else does — an agent that cannot
+reach the control plane still stops honouring an expired grant. Explicit revocation is the
+fast path.
 
-**Revocation does not currently reach a live session.** It is checked when a connection is
-established, so a peer revoked mid-session keeps that session until it ends; restarting
-the relay is the way to drop it. This is a real gap rather than a design choice, and it
-matters most for the case revocation exists to handle — a credential believed to be
-compromised *right now*.
+### What revocation actually does
+
+Three kinds of state, in this order, because they fail differently:
+
+1. **The database.** The grant row is marked revoked with a reason, and the audit event is
+   written in the same transaction. This is the durable record.
+2. **New streams.** The relay resolves a grant's state when a stream is opened, so a
+   revoked grant is refused with `grant_revoked` before the agent is contacted.
+3. **Running streams.** The relay registers every joined stream against the grant that
+   authorized it and resets **both ends** when that grant is revoked. Resetting only the
+   operator's side would leave the agent holding an open connection to the local service,
+   which is the resource being taken away.
+
+Cascades run downward and each step is recorded separately, one audit event per grant
+rather than one for the cascade — an administrator asking later why a particular grant
+stopped working must find that grant's own record, not a summary naming something else.
+
+**What is still not covered:** revoking an identity does not tear down a *data-plane
+session* that is already established. The grants are revoked and the streams are dropped,
+so the peer can do nothing with the connection, but the connection itself survives until
+it ends or the relay restarts. A relay running in a separate process from the control
+plane would also learn of a revocation only at its next grant check, which happens when a
+stream opens; the shipped topology runs both in one process, where the drop is immediate.
 
 ## Audit events
 
-Emitted **before** the corresponding action completes, so a crash cannot produce an
-unlogged action.
+The trail lives in the control-plane database, append-only: nothing in the software
+updates or deletes a row.
+
+A grant and the record of that grant commit in **one transaction**. Access that nothing
+accounts for is worse than access refused, so a grant whose record cannot be written is
+not issued. The same holds for opening an operator session. Events that merely *report*
+something already finished — a stream that closed, an endpoint that disconnected — are
+written outside a transaction and a failure is logged rather than propagated, because
+failing the operation afterwards would not un-happen it.
+
+The set of names is closed and defined in `internal/control/audit`. Inventing a name at
+the call site is how a trail ends up with three spellings of one event and the query that
+matters finds two of them.
 
 ```
-device.enrolled       device.connected      device.disconnected   device.revoked
-resource.registered
-grant.created         grant.denied          grant.revoked         grant.expired
+device.enrolled       device.revoked        operator.enrolled     operator.revoked
+enroll.denied
+device.connected      device.disconnected
+operator.login        operator.login_denied operator.logout       operator.session_revoked
+grant.created         grant.denied          grant.revoked
 stream.opened         stream.denied         stream.closed
-policy.created        policy.deleted
-admin.login           admin.action
+admin.action
 ```
 
-Every event carries `timestamp`, `org_id`, actor, subject IDs, and, for any denial, a
-reason code from the fixed list in [protocol.md](protocol.md).
+`sar-server audit -events` prints this list.
 
-`stream.closed` additionally carries `bytes_in`, `bytes_out`, `duration`, and
-`close_reason`.
+Every event carries a monotonic sequence number, a timestamp, and whichever of `org_id`,
+actor role and identifier, `device_id`, `resource_id`, `grant_id`, and `session_id` apply.
+Every denial carries a reason code from the fixed list in [protocol.md](protocol.md).
 
-Never present in an audit event: bearer tokens, private keys, grant signatures, target
-response bodies, or payload bytes.
+The sequence number exists because timestamps are stored to the second, and a grant and
+the stream it authorized routinely land in the same one. Ordering by time alone would
+present them as simultaneous and lose the causal order.
+
+`stream.closed` additionally carries `bytes_in`, `bytes_out`, and `duration_ms`.
+
+**Never present in an audit event:** bearer tokens, private keys, grant signatures, target
+response bodies, or payload bytes. An audit trail records that access happened and under
+what authority; one that also held the traffic would make reading the evidence a second
+disclosure of whatever was being protected. There is an end-to-end test that sends a
+canary string through a forward and fails if it appears in any column of any row.
+
+**Not emitted, and why:** `resource.registered` — resources are declared on the agent, not
+registered with the control plane. `policy.created` / `policy.deleted` — policy is a file
+read at startup. `grant.expired` — expiry is passive; nothing observes the moment a grant
+lapses, and a row written by a sweep would claim an event that no component acted on.
+
+### Querying
+
+```sh
+sar-server audit -since 24h
+sar-server audit -denials
+sar-server audit -device panel-lab-01 -event stream.closed
+sar-server audit -actor maria -grant grn_...
+```
+
+Filters match exactly. There is no pattern matching, deliberately: a wildcard over an
+audit trail is a way to answer a narrower question than the one asked and believe it was
+the whole answer. Results are capped, and the cap is reported when it is reached — a
+truncated result that looks complete is how somebody concludes an incident was smaller
+than it was.

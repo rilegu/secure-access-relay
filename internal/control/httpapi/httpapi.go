@@ -1,9 +1,10 @@
 // Package httpapi serves the control-plane HTTP interface.
 //
-// Only enrollment exists so far. It is separate from the relay's data plane on
-// purpose: the control plane decides who may exist, the relay carries bytes for
-// peers that already do, and keeping them apart is what lets them be deployed and
-// hardened separately later — see docs/decisions/0007.
+// It carries enrollment, operator login, and grant issuance. It is separate from
+// the relay's data plane on purpose: the control plane decides who may exist and
+// what they may reach, the relay carries bytes for peers that already do, and
+// keeping them apart is what lets them be deployed and hardened separately
+// later — see docs/decisions/0007.
 //
 // # What this package must never do
 //
@@ -25,8 +26,10 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/rilegu/secure-access-relay/internal/control/audit"
 	"github.com/rilegu/secure-access-relay/internal/control/enrollment"
 	"github.com/rilegu/secure-access-relay/internal/control/grants"
+	"github.com/rilegu/secure-access-relay/internal/control/login"
 	"github.com/rilegu/secure-access-relay/internal/control/policy"
 	"github.com/rilegu/secure-access-relay/internal/storage"
 )
@@ -43,13 +46,25 @@ type Server struct {
 	enroll *enrollment.Service
 	issuer *grants.Issuer
 	verify *enrollment.Service
+	login  *login.Service
+	audit  *audit.Recorder
 	rules  RulesFunc
 	log    *slog.Logger
+
+	// terminate drops the live streams a set of revoked grants authorized.
+	//
+	// A function rather than a reference to the relay, so the control plane does
+	// not import it. The dependency runs one way: the control plane decides, the
+	// relay is told, and the relay never calls back.
+	terminate TerminateFunc
 
 	srv   *http.Server
 	ln    net.Listener
 	ready chan struct{}
 }
+
+// TerminateFunc drops every live stream opened under any of the named grants.
+type TerminateFunc func(grantIDs []string)
 
 // Config configures the control-plane server.
 type Config struct {
@@ -64,6 +79,20 @@ type Config struct {
 
 	// Rules supplies the policy rule set for each request.
 	Rules RulesFunc
+
+	// Login issues and ends operator sessions. When it is set, a grant request
+	// must carry a live session; when it is nil, the login routes report that
+	// sessions are not configured and grants are issued on the certificate alone.
+	Login *login.Service
+
+	// Audit records events that are not already written inside a transaction by
+	// the component that caused them.
+	Audit *audit.Recorder
+
+	// Terminate drops live streams when a grant is revoked. Without it a
+	// revocation still stops new streams but leaves running ones alone, which is
+	// the gap revocation exists to close — so its absence is logged at startup.
+	Terminate TerminateFunc
 
 	Logger *slog.Logger
 }
@@ -85,16 +114,21 @@ func New(cfg Config, enroll *enrollment.Service) (*Server, error) {
 	}
 
 	s := &Server{
-		enroll: enroll,
-		issuer: cfg.Issuer,
-		verify: enroll,
-		rules:  rules,
-		log:    cfg.Logger,
-		ready:  make(chan struct{}),
+		enroll:    enroll,
+		issuer:    cfg.Issuer,
+		verify:    enroll,
+		login:     cfg.Login,
+		audit:     cfg.Audit,
+		rules:     rules,
+		terminate: cfg.Terminate,
+		log:       cfg.Logger,
+		ready:     make(chan struct{}),
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/enroll", s.handleEnroll)
+	mux.HandleFunc("POST /v1/login", s.handleLogin)
+	mux.HandleFunc("POST /v1/logout", s.handleLogout)
 	mux.HandleFunc("POST /v1/grants", s.handleGrant)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -189,10 +223,16 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 			errors.Is(err, storage.ErrTokenExpired):
 			s.log.Warn("enrollment refused",
 				"remote", r.RemoteAddr, "error", err.Error())
+			// Recorded with a coarse reason, not the specific one. The caller is
+			// told nothing that helps them tell a valid token from an invalid one,
+			// and the trail records that somebody tried — which is the part worth
+			// noticing when it happens repeatedly.
+			s.recordEnrollDenied(r, "token_refused")
 			writeError(w, http.StatusForbidden, "enrollment refused")
 			return
 		case errors.Is(err, enrollment.ErrInvalidCSR):
 			s.log.Warn("enrollment csr rejected", "remote", r.RemoteAddr, "error", err.Error())
+			s.recordEnrollDenied(r, "invalid_csr")
 			writeError(w, http.StatusBadRequest, "invalid certificate request")
 			return
 		default:
@@ -207,6 +247,10 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		"remote", r.RemoteAddr,
 		"not_after", result.NotAfter.UTC().Format(time.RFC3339),
 	)
+	if s.audit != nil {
+		s.audit.Enrolled(r.Context(), string(result.Identity.Role), result.Identity.ID,
+			"from "+remoteHost(r)+", certificate valid until "+result.NotAfter.UTC().Format(time.RFC3339))
+	}
 
 	writeJSON(w, http.StatusOK, enrollResponse{
 		Certificate: string(result.CertificatePEM),
@@ -215,6 +259,18 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		NotAfter:    result.NotAfter.UTC().Format(time.RFC3339),
 		GrantKey:    base64.StdEncoding.EncodeToString(result.GrantPublicKey),
 	})
+}
+
+// recordEnrollDenied records a refused enrollment.
+//
+// The token is never recorded, not even hashed. A refused attempt may carry a
+// value the caller should not have had, and copying it into durable storage
+// would preserve exactly the thing that should not be preserved.
+func (s *Server) recordEnrollDenied(r *http.Request, reason string) {
+	if s.audit == nil {
+		return
+	}
+	s.audit.EnrollDenied(r.Context(), remoteHost(r), reason)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

@@ -268,13 +268,15 @@ func TestOperatorRefusesUntrustedRelay(t *testing.T) {
 
 	ours := newDeployment(t)
 	ours.startControlPlane(ctx)
+	ourOperator := ours.enrollIdentity(ca.RoleOperator, testUserID)
 	f, err := operator.New(operator.Config{
 		RelayAddr:   hostileRelay.Addr(),
 		ControlAddr: ours.controlAddr,
-		Identity:    ours.enrollIdentity(ca.RoleOperator, testUserID),
+		Identity:    ourOperator,
 		ListenAddr:  "127.0.0.1:0",
 		DeviceID:    "dev_anything",
 		Resource:    testResourceID,
+		Session:     ours.sessionTokenFor(ourOperator),
 		Logger:      discardLogger(),
 	})
 	if err != nil {
